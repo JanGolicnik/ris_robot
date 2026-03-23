@@ -1,0 +1,1 @@
+ros2 run dis_tutorial3 detect_people.py

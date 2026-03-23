@@ -1,0 +1,8 @@
+
+.venv/
+
+build/
+
+install/
+
+log/
