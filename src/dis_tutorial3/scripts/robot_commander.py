@@ -14,19 +14,24 @@
 # limitations under the License.
 
 
+import math
 import time
 from enum import Enum
 
+import numpy as np
 import rclpy
 from action_msgs.msg import GoalStatus
 from builtin_interfaces.msg import Duration
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Quaternion
+from geometry_msgs.msg import (
+    PoseStamped,
+    PoseWithCovarianceStamped,
+    Quaternion,
+)
 from irobot_create_msgs.action import Dock, Undock
 from irobot_create_msgs.msg import DockStatus
 from lifecycle_msgs.srv import GetState
 from nav2_msgs.action import NavigateToPose, Spin
 from rclpy.action import ActionClient
-from rclpy.duration import Duration as rclpyDuration
 from rclpy.node import Node
 from rclpy.qos import (
     QoSDurabilityPolicy,
@@ -46,16 +51,6 @@ class TaskResult(Enum):
     FAILED = 3
 
 
-amcl_pose_qos = QoSProfile(
-    durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
-    reliability=QoSReliabilityPolicy.RELIABLE,
-    history=QoSHistoryPolicy.KEEP_LAST,
-    depth=1,
-)
-
-face_positions = [[1.73, 5.21], [-2.74, 7.88], [-1.28, 3.3]]
-
-
 class RobotCommander(Node):
     def __init__(self, node_name="robot_commander", namespace=""):
         super().__init__(node_name=node_name, namespace=namespace)
@@ -69,31 +64,42 @@ class RobotCommander(Node):
         self.status = None
         self.initial_pose_received = False
         self.is_docked = None
+        self.roam_positions = [[1.73, 5.21], [-2.74, 7.88], [-1.28, 3.3]]
+        self.detected_face_candidates = []
+        self.detected_faces = []
 
-        # ROS2 subscribers
         self.create_subscription(
             DockStatus, "dock_status", self._dockCallback, qos_profile_sensor_data
         )
+
         self.localization_pose_sub = self.create_subscription(
             PoseWithCovarianceStamped,
             "amcl_pose",
             self._amclPoseCallback,
-            amcl_pose_qos,
+            QoSProfile(
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+            ),
         )
 
-        self.face_marker_sub = self.create_subscription(
-            Marker,
-            "/people_marker",
-            self._faceMarkerCallback,
-            amcl_pose_qos,
+        self.face_pos_sub = self.create_subscription(
+            PoseStamped,
+            "/face_positions",
+            self._facePosCallback,
+            QoSProfile(depth=10, reliability=QoSReliabilityPolicy.BEST_EFFORT),
         )
 
-        # ROS2 publishers
         self.initial_pose_pub = self.create_publisher(
             PoseWithCovarianceStamped, "initialpose", 10
         )
 
-        # ROS2 Action clients
+        self.marker_pub = self.create_publisher(Marker, "/goal_marker", 10)
+        self.detected_marker_pub = self.create_publisher(
+            Marker, "/detected_face_marker", 10
+        )
+
         self.nav_to_pose_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
         self.spin_client = ActionClient(self, Spin, "spin")
         self.undock_action_client = ActionClient(self, Undock, "undock")
@@ -101,7 +107,62 @@ class RobotCommander(Node):
 
         self.get_logger().info(f"Robot commander has been initialized!")
 
-    def destroyNode(self):
+    def init(self):
+        self.waitUntilNav2Active()
+
+        while self.is_docked is None:
+            rclpy.spin_once(self, timeout_sec=0.5)
+
+        if self.is_docked:
+            self.undock()
+
+    def main_loop(self):
+        face_i = 0
+        while True:
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+            for i, face in enumerate(self.detected_faces):
+                marker = Marker()
+                marker.header.frame_id = "map"
+                marker.header.stamp = self.get_clock().now().to_msg()
+                marker.type = Marker.SPHERE
+                marker.action = Marker.ADD
+                marker.id = i
+                marker.scale.x = 0.3
+                marker.scale.y = 0.3
+                marker.scale.z = 0.3
+                marker.color.r = 0.0
+                marker.color.g = 1.0
+                marker.color.b = 0.0
+                marker.color.a = 1.0
+                marker.pose.position.x = float(face["pos"][0])
+                marker.pose.position.y = float(face["pos"][1])
+                marker.pose.position.z = 0.0
+                self.detected_marker_pub.publish(marker)
+
+            if not self.isTaskComplete():
+                self.info("waiting to reaach face")
+                continue
+
+            if face_i < len(self.detected_faces):
+                self.info("going towards a face")
+                face = self.detected_faces[face_i]
+                pos = face["pos"] - face["normal"]
+                dir = face["pos"] - pos
+                yaw = math.atan2(dir[1], dir[0])
+                goal_pose = PoseStamped()
+                goal_pose.header.frame_id = "map"
+                goal_pose.header.stamp = self.get_clock().now().to_msg()
+
+                goal_pose.pose.position.x = float(pos[0])
+                goal_pose.pose.position.y = float(pos[1])
+                goal_pose.pose.orientation = self.YawToQuaternion(yaw)
+
+                self.publish_goal_marker(float(pos[0]), float(pos[1]))
+                face_i += 1
+                self.goToPose(goal_pose)
+
+    def destroy(self):
         self.nav_to_pose_client.destroy()
         super().destroy_node()
 
@@ -136,28 +197,6 @@ class RobotCommander(Node):
                 + str(pose.pose.position.y)
                 + " was rejected!"
             )
-            return False
-
-        self.result_future = self.goal_handle.get_result_async()
-        return True
-
-    def spin(self, spin_dist=1.57, time_allowance=10):
-        self.debug("Waiting for 'Spin' action server")
-        while not self.spin_client.wait_for_server(timeout_sec=1.0):
-            self.info("'Spin' action server not available, waiting...")
-        goal_msg = Spin.Goal()
-        goal_msg.target_yaw = spin_dist
-        goal_msg.time_allowance = Duration(sec=time_allowance)
-
-        self.info(f"Spinning to angle {goal_msg.target_yaw}....")
-        send_goal_future = self.spin_client.send_goal_async(
-            goal_msg, self._feedbackCallback
-        )
-        rclpy.spin_until_future_complete(self, send_goal_future)
-        self.goal_handle = send_goal_future.result()
-
-        if not self.goal_handle.accepted:
-            self.error("Spin request was rejected!")
             return False
 
         self.result_future = self.goal_handle.get_result_async()
@@ -293,9 +332,52 @@ class RobotCommander(Node):
         self.current_pose = msg.pose
         return
 
-    def _faceMarkerCallback(self, msg):
-        self.debug("Received face marker")
-        return
+    def _facePosCallback(self, msg):
+        pos = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
+        normal = np.array(
+            [msg.pose.orientation.x, msg.pose.orientation.y, msg.pose.orientation.z]
+        )
+        now = time.time()
+
+        self.info("faceposcallback called")
+
+        if any(np.linalg.norm(pos - f["pos"]) < 0.5 for f in self.detected_faces):
+            self.info("this person has already been detected")
+            return  # already detected
+
+        i = next(
+            (
+                i
+                for i, c in enumerate(self.detected_face_candidates)
+                if np.linalg.norm(c["pos"] - pos) < 0.5
+            ),
+            None,
+        )
+
+        if i is None:
+            self.info("first time this candidate was seen")
+            self.detected_face_candidates.append(
+                {"pos": pos, "normal": normal, "times": [now]}
+            )
+            return
+
+        candidate = self.detected_face_candidates[i]
+
+        self.info("candidate with similar position found")
+
+        candidate["times"].append(now)
+        candidate["pos"] = np.mean([candidate["pos"], pos], axis=0)
+        candidate["times"] = [t for t in candidate["times"] if now - t < 2.0]
+
+        if len(candidate["times"]) >= 5:
+            self.detected_faces.append(
+                {"pos": candidate["pos"].copy(), "normal": candidate["normal"]}
+            )
+            self.detected_face_candidates.pop(i)
+            self.info(f"detected a new face at: {candidate['pos']}!")
+            return
+
+        self.info("candidate hasnt been detected enough yet")
 
     def _feedbackCallback(self, msg):
         self.debug("Received action feedback message")
@@ -304,15 +386,6 @@ class RobotCommander(Node):
 
     def _dockCallback(self, msg: DockStatus):
         self.is_docked = msg.is_docked
-
-    def setInitialPose(self, pose):
-        msg = PoseWithCovarianceStamped()
-        msg.pose.pose = pose
-        msg.header.frame_id = self.pose_frame_id
-        msg.header.stamp = 0
-        self.info("Publishing Initial Pose")
-        self.initial_pose_pub.publish(msg)
-        return
 
     def info(self, msg):
         self.get_logger().info(msg)
@@ -330,42 +403,32 @@ class RobotCommander(Node):
         self.get_logger().debug(msg)
         return
 
+    def publish_goal_marker(self, x, y):
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.id = 0
+        marker.scale.x = 0.5
+        marker.scale.y = 0.5
+        marker.scale.z = 0.5
+        marker.color.r = 1.0
+        marker.color.g = 0.0
+        marker.color.b = 0.0
+        marker.color.a = 1.0
+        marker.pose.position.x = x
+        marker.pose.position.y = y
+        marker.pose.position.z = 0.0
+        self.marker_pub.publish(marker)
+
 
 def main(args=None):
-
     rclpy.init(args=args)
     rc = RobotCommander()
-
-    # Wait until Nav2 and Localizer are available
-    rc.waitUntilNav2Active()
-
-    # Check if the robot is docked, only continue when a message is recieved
-    while rc.is_docked is None:
-        rclpy.spin_once(rc, timeout_sec=0.5)
-
-    # If it is docked, undock it first
-    if rc.is_docked:
-        rc.undock()
-
-    current_face_position = 0
-    while current_face_position < len(face_positions):
-        goal_pose = PoseStamped()
-        goal_pose.header.frame_id = "map"
-        goal_pose.header.stamp = rc.get_clock().now().to_msg()
-
-        goal_pose.pose.position.x = face_positions[current_face_position][0]
-        goal_pose.pose.position.y = face_positions[current_face_position][1]
-        goal_pose.pose.orientation = rc.YawToQuaternion(0.0)
-
-        rc.goToPose(goal_pose)
-
-        while not rc.isTaskComplete():
-            rc.info("Waiting for the task to complete...")
-            time.sleep(1)
-
-        current_face_position += 1
-
-    rc.destroyNode()
+    rc.init()
+    rc.main_loop()
+    rc.destroy()
 
 
 if __name__ == "__main__":
