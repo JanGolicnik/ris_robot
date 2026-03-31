@@ -44,6 +44,7 @@ from rclpy.qos import (
 )
 from turtle_tf2_py.turtle_tf2_broadcaster import quaternion_from_euler
 from visualization_msgs.msg import Marker
+import subprocess
 
 
 class TaskResult(Enum):
@@ -56,7 +57,7 @@ class TaskResult(Enum):
 class State(Enum):
     SEARCHING = auto()
     MOVING_TO_FACE = auto()
-    POZDRAVLJANJE = auto()
+    # POZDRAVLJANJE = auto()
     KONCAL = auto()
 
 
@@ -76,8 +77,12 @@ class RobotCommander(Node):
         self.roam_positions = [[1.73, 5.21], [-2.74, 7.88], [-1.28, 3.3]]
         self.detected_face_candidates = []
         self.detected_faces = []
-        self.face_i = 0
+        self.visited_visited_face_i = 0
         self.state = State.SEARCHING
+        self.pozdrav_start_time = None
+        self.detected_ring_candidates = []
+        self.detected_rings = []
+        self.visited_ring_i = 0
 
         self.create_subscription(
             DockStatus, "dock_status", self._dockCallback, qos_profile_sensor_data
@@ -100,6 +105,13 @@ class RobotCommander(Node):
             "/face_positions",
             self._facePosCallback,
             QoSProfile(depth=10, reliability=QoSReliabilityPolicy.BEST_EFFORT),
+        )
+
+        self.ring_sub = self.create_subscription(
+            PoseStamped,
+            "/ring_positions",
+            self._ringCallback,
+            QoSProfile(depth=10, reliability=QoSReliabilityPolicy.BEST_EFFORT)
         )
 
         self.initial_pose_pub = self.create_publisher(
@@ -161,10 +173,10 @@ class RobotCommander(Node):
             self.info("waiting to detect face")
             return
 
-        if self.face_i < len(self.detected_faces):
+        if self.visited_face_i < len(self.detected_faces):
             self.state = State.MOVING_TO_FACE
             self.info("going towards a face")
-            face = self.detected_faces[self.face_i]
+            face = self.detected_faces[self.visited_face_i]
             pos = face["pos"] + face["normal"]
             dir = face["pos"] - pos
             yaw = math.atan2(dir[1], dir[0])
@@ -177,15 +189,19 @@ class RobotCommander(Node):
             goal_pose.pose.orientation = self.YawToQuaternion(yaw)
 
             self.publish_goal_marker(float(pos[0]), float(pos[1]))
-            self.face_i += 1
+            self.visited_face_i += 1
             self.goToPose(goal_pose)
+
+        if self.visited_face_i == 3 and self.visited_ring_i == 2:
+            self.state = State.KONCAL
+            self.info("Finished checking all! :3")
 
     def update_moving_to_face(self):
         if not self.isTaskComplete():
             self.info("waiting to reach face")
             return
-        self.state = State.SEARCHING
         self.pozdravi()
+        self.state = State.SEARCHING
 
     def pozdravi(self):
         model = KittenTTS()
@@ -194,6 +210,18 @@ class RobotCommander(Node):
         )
         model.generate_to_file("Alo Stari!", wav_path, voice="Jasper", speed=1.0)
         os.system(f"ffplay -nodisp -autoexit {wav_path} 2>/dev/null")
+
+    def say_color(self, color):
+        model = KittenTTS()
+        wav_path = "/tmp/ring.wav"
+
+        model.generate_to_file(f"{color}", wav_path, voice="Jasper", speed=1.0)
+
+        subprocess.Popen(
+            ["ffplay", "-nodisp", "-autoexit", wav_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
 
     def destroy(self):
         self.nav_to_pose_client.destroy()
@@ -411,6 +439,53 @@ class RobotCommander(Node):
             return
 
         self.info("candidate hasnt been detected enough yet")
+
+    def _ringCallback(self, msg):
+        pos = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
+        color = msg.header.frame_id
+        now = time.time()
+
+        self.info(f"Ring detected: {color}")
+
+        # already confirmed -> ignore
+
+        if any(np.linalg.norm(pos - r["pos"]) < 0.5 for r in self.detected_rings):
+            self.info("this ring has already been detected")
+            return   
+
+        # find existing candidate
+        i = next(
+            (
+                i
+                for i, c in enumerate(self.detected_ring_candidates)
+                if np.linalg.norm(c["pos"] - pos) < 0.5
+            ),
+            None,
+        ) 
+
+        if i is None:
+            self.info("first time ring candidate was seen")
+            self.detected_ring_candidates.append({
+                "pos": pos, 
+                "color": color, 
+                "times": [now]
+            })
+            return
+        
+        candidate = self.detected_ring_candidates[i]
+
+        candidate["times"].append(now)
+        candidate["pos"] = np.mean([candidate["pos"], pos], axis=0)
+        candidate["times"] = [t for t in candidate["times"] if now - t < 2.0]
+
+        if len(candidate["times"]) >= 5:
+            self.detected_rings.append({
+                "pos": candidate["pos"].copy(),
+                "color": candidate["color"]
+            })
+
+            self.detected_ring_candidates.pop()
+            self.info(f"CONFIRMED ring: {color}")
 
     def _feedbackCallback(self, msg):
         self.debug("Received action feedback message")
