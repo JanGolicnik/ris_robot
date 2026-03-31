@@ -15,8 +15,9 @@
 
 
 import math
+import os
 import time
-from enum import Enum
+from enum import Enum, auto
 
 import numpy as np
 import rclpy
@@ -29,6 +30,7 @@ from geometry_msgs.msg import (
 )
 from irobot_create_msgs.action import Dock, Undock
 from irobot_create_msgs.msg import DockStatus
+from kittentts import KittenTTS
 from lifecycle_msgs.srv import GetState
 from nav2_msgs.action import NavigateToPose, Spin
 from rclpy.action import ActionClient
@@ -51,6 +53,13 @@ class TaskResult(Enum):
     FAILED = 3
 
 
+class State(Enum):
+    SEARCHING = auto()
+    MOVING_TO_FACE = auto()
+    POZDRAVLJANJE = auto()
+    KONCAL = auto()
+
+
 class RobotCommander(Node):
     def __init__(self, node_name="robot_commander", namespace=""):
         super().__init__(node_name=node_name, namespace=namespace)
@@ -67,6 +76,8 @@ class RobotCommander(Node):
         self.roam_positions = [[1.73, 5.21], [-2.74, 7.88], [-1.28, 3.3]]
         self.detected_face_candidates = []
         self.detected_faces = []
+        self.face_i = 0
+        self.state = State.SEARCHING
 
         self.create_subscription(
             DockStatus, "dock_status", self._dockCallback, qos_profile_sensor_data
@@ -117,9 +128,14 @@ class RobotCommander(Node):
             self.undock()
 
     def main_loop(self):
-        face_i = 0
         while True:
             rclpy.spin_once(self, timeout_sec=0.1)
+
+            if self.state == State.SEARCHING:
+                self.update_search()
+
+            if self.state == State.MOVING_TO_FACE:
+                self.update_moving_to_face()
 
             for i, face in enumerate(self.detected_faces):
                 marker = Marker()
@@ -140,27 +156,44 @@ class RobotCommander(Node):
                 marker.pose.position.z = 0.0
                 self.detected_marker_pub.publish(marker)
 
-            if not self.isTaskComplete():
-                self.info("waiting to reaach face")
-                continue
+    def update_search(self):
+        if not self.isTaskComplete():
+            self.info("waiting to detect face")
+            return
 
-            if face_i < len(self.detected_faces):
-                self.info("going towards a face")
-                face = self.detected_faces[face_i]
-                pos = face["pos"] + face["normal"]
-                dir = face["pos"] - pos
-                yaw = math.atan2(dir[1], dir[0])
-                goal_pose = PoseStamped()
-                goal_pose.header.frame_id = "map"
-                goal_pose.header.stamp = self.get_clock().now().to_msg()
+        if self.face_i < len(self.detected_faces):
+            self.state = State.MOVING_TO_FACE
+            self.info("going towards a face")
+            face = self.detected_faces[self.face_i]
+            pos = face["pos"] + face["normal"]
+            dir = face["pos"] - pos
+            yaw = math.atan2(dir[1], dir[0])
+            goal_pose = PoseStamped()
+            goal_pose.header.frame_id = "map"
+            goal_pose.header.stamp = self.get_clock().now().to_msg()
 
-                goal_pose.pose.position.x = float(pos[0])
-                goal_pose.pose.position.y = float(pos[1])
-                goal_pose.pose.orientation = self.YawToQuaternion(yaw)
+            goal_pose.pose.position.x = float(pos[0])
+            goal_pose.pose.position.y = float(pos[1])
+            goal_pose.pose.orientation = self.YawToQuaternion(yaw)
 
-                self.publish_goal_marker(float(pos[0]), float(pos[1]))
-                face_i += 1
-                self.goToPose(goal_pose)
+            self.publish_goal_marker(float(pos[0]), float(pos[1]))
+            self.face_i += 1
+            self.goToPose(goal_pose)
+
+    def update_moving_to_face(self):
+        if not self.isTaskComplete():
+            self.info("waiting to reach face")
+            return
+        self.state = State.SEARCHING
+        self.pozdravi()
+
+    def pozdravi(self):
+        model = KittenTTS()
+        wav_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "greeting.wav"
+        )
+        model.generate_to_file("Alo Stari!", wav_path, voice="Jasper", speed=1.0)
+        os.system(f"ffplay -nodisp -autoexit {wav_path} 2>/dev/null")
 
     def destroy(self):
         self.nav_to_pose_client.destroy()
