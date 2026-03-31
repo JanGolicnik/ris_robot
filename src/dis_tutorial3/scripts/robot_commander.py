@@ -147,7 +147,7 @@ class RobotCommander(Node):
             if face_i < len(self.detected_faces):
                 self.info("going towards a face")
                 face = self.detected_faces[face_i]
-                pos = face["pos"] - face["normal"]
+                pos = face["pos"] + face["normal"]
                 dir = face["pos"] - pos
                 yaw = math.atan2(dir[1], dir[0])
                 goal_pose = PoseStamped()
