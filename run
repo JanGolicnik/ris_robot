@@ -1,1 +1,1 @@
-ros2 launch dis_tutorial3 sim_turtlebot_nav.launch.py
+ros2 launch dis_tutorial3 sim_turtlebot_nav.launch.py world:=task1_green_demo

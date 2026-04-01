@@ -1,0 +1,14 @@
+waypoints:
+  - x: 1.73
+    y: 5.21
+    yaw: 0.0
+    spin: false
+  - x: -2.74
+    y: 7.88
+    yaw: 1.57
+    spin: true
+    spin_angle: 6.28
+  - x: -1.28
+    y: 3.3
+    yaw: 0.0
+    spin: false

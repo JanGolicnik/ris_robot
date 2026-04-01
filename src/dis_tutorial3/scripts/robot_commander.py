@@ -16,11 +16,13 @@
 
 import math
 import os
+import subprocess
 import time
 from enum import Enum, auto
 
 import numpy as np
 import rclpy
+import yaml
 from action_msgs.msg import GoalStatus
 from builtin_interfaces.msg import Duration
 from geometry_msgs.msg import (
@@ -44,7 +46,6 @@ from rclpy.qos import (
 )
 from turtle_tf2_py.turtle_tf2_broadcaster import quaternion_from_euler
 from visualization_msgs.msg import Marker
-import subprocess
 
 
 class TaskResult(Enum):
@@ -77,12 +78,25 @@ class RobotCommander(Node):
         self.roam_positions = [[1.73, 5.21], [-2.74, 7.88], [-1.28, 3.3]]
         self.detected_face_candidates = []
         self.detected_faces = []
-        self.visited_visited_face_i = 0
+        self.visited_face_i = 0
         self.state = State.SEARCHING
         self.pozdrav_start_time = None
         self.detected_ring_candidates = []
         self.detected_rings = []
-        self.visited_ring_i = 0
+        self.pending_spin = None
+
+        self.waypoints = []
+        self.waypoint_i = 0
+        self.spinning = False
+
+        waypoint_file = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "waypoints.yaml"
+        )
+        if os.path.exists(waypoint_file):
+            with open(waypoint_file) as f:
+                data = yaml.safe_load(f)
+                self.waypoints = data.get("waypoints", [])
+            self.info(f"Loaded {len(self.waypoints)} waypoints")
 
         self.create_subscription(
             DockStatus, "dock_status", self._dockCallback, qos_profile_sensor_data
@@ -111,7 +125,7 @@ class RobotCommander(Node):
             PoseStamped,
             "/ring_positions",
             self._ringCallback,
-            QoSProfile(depth=10, reliability=QoSReliabilityPolicy.BEST_EFFORT)
+            QoSProfile(depth=10, reliability=QoSReliabilityPolicy.BEST_EFFORT),
         )
 
         self.initial_pose_pub = self.create_publisher(
@@ -172,6 +186,10 @@ class RobotCommander(Node):
         if not self.isTaskComplete():
             self.info("waiting to detect face")
             return
+        if self.pending_spin is not None:
+            self.doSpin(self.pending_spin)
+            self.pending_spin = None
+            self.state = State.SEARCHING
 
         if self.visited_face_i < len(self.detected_faces):
             self.state = State.MOVING_TO_FACE
@@ -192,9 +210,28 @@ class RobotCommander(Node):
             self.visited_face_i += 1
             self.goToPose(goal_pose)
 
-        if self.visited_face_i == 3 and self.visited_ring_i == 2:
+        if self.visited_face_i == 3 and len(self.detected_rings) == 2:
             self.state = State.KONCAL
             self.info("Finished checking all! :3")
+
+        if self.waypoint_i < len(self.waypoints):
+            wp = self.waypoints[self.waypoint_i]
+            self.waypoint_i += 1
+            self.info(f"Moving to waypoint {self.waypoint_i}/{len(self.waypoints)}")
+
+            goal_pose = PoseStamped()
+            goal_pose.header.frame_id = "map"
+            goal_pose.header.stamp = self.get_clock().now().to_msg()
+            goal_pose.pose.position.x = float(wp["x"])
+            goal_pose.pose.position.y = float(wp["y"])
+            goal_pose.pose.orientation = self.YawToQuaternion(float(wp.get("yaw", 0.0)))
+            self.publish_goal_marker(float(wp["x"]), float(wp["y"]))
+            self.goToPose(goal_pose)
+
+            if wp.get("spin", False):
+                self.pending_spin = float(wp.get("spin_angle", 6.28))
+            else:
+                self.pending_spin = None
 
     def update_moving_to_face(self):
         if not self.isTaskComplete():
@@ -220,7 +257,7 @@ class RobotCommander(Node):
         subprocess.Popen(
             ["ffplay", "-nodisp", "-autoexit", wav_path],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            stderr=subprocess.DEVNULL,
         )
 
     def destroy(self):
@@ -451,7 +488,7 @@ class RobotCommander(Node):
 
         if any(np.linalg.norm(pos - r["pos"]) < 0.5 for r in self.detected_rings):
             self.info("this ring has already been detected")
-            return   
+            return
 
         # find existing candidate
         i = next(
@@ -461,17 +498,15 @@ class RobotCommander(Node):
                 if np.linalg.norm(c["pos"] - pos) < 0.5
             ),
             None,
-        ) 
+        )
 
         if i is None:
             self.info("first time ring candidate was seen")
-            self.detected_ring_candidates.append({
-                "pos": pos, 
-                "color": color, 
-                "times": [now]
-            })
+            self.detected_ring_candidates.append(
+                {"pos": pos, "color": color, "times": [now]}
+            )
             return
-        
+
         candidate = self.detected_ring_candidates[i]
 
         candidate["times"].append(now)
@@ -479,13 +514,12 @@ class RobotCommander(Node):
         candidate["times"] = [t for t in candidate["times"] if now - t < 2.0]
 
         if len(candidate["times"]) >= 5:
-            self.detected_rings.append({
-                "pos": candidate["pos"].copy(),
-                "color": candidate["color"]
-            })
-
+            self.detected_rings.append(
+                {"pos": candidate["pos"].copy(), "color": candidate["color"]}
+            )
             self.detected_ring_candidates.pop()
             self.info(f"CONFIRMED ring: {color}")
+            self.say_color(f"{color}")
 
     def _feedbackCallback(self, msg):
         self.debug("Received action feedback message")
