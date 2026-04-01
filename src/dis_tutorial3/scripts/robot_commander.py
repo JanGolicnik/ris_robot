@@ -250,8 +250,9 @@ class RobotCommander(Node):
 
     def say_color(self, color):
         model = KittenTTS()
-        wav_path = "/tmp/ring.wav"
-
+        wav_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "ring.wav"
+        )
         model.generate_to_file(f"{color}", wav_path, voice="Jasper", speed=1.0)
 
         subprocess.Popen(
@@ -517,9 +518,10 @@ class RobotCommander(Node):
             self.detected_rings.append(
                 {"pos": candidate["pos"].copy(), "color": candidate["color"]}
             )
+
             self.detected_ring_candidates.pop()
             self.info(f"CONFIRMED ring: {color}")
-            self.say_color(f"{color}")
+            self.say_color(candidate["color"])
 
     def _feedbackCallback(self, msg):
         self.debug("Received action feedback message")
