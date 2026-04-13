@@ -64,6 +64,7 @@ class detect_faces(Node):
         self.face_pos_pub = self.create_publisher(
             PoseStamped, face_topic, QoSReliabilityPolicy.BEST_EFFORT
         )
+        self.face_img_pub = self.create_publisher(Image, "/face_image", 10)
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -71,6 +72,8 @@ class detect_faces(Node):
         self.model = YOLO("yolov8n.pt")
 
         self.faces = []
+
+        self.cv_image = None
 
         self.get_logger().info(
             f"Node has been initialized! Will publish face markers to {marker_topic}."
@@ -82,6 +85,7 @@ class detect_faces(Node):
 
         try:
             cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
+            self.cv_image = cv_image
 
             self.get_logger().info(f"Running inference on image...")
 
@@ -192,7 +196,7 @@ class detect_faces(Node):
             down = np.array([0.0, 0.0, -1.0])
             v = p1 - p2
             v = v / np.linalg.norm(v)
-            normal = np.cross(down, v)
+            normal = np.cross(down, v) * 0.5
 
             # normal = point_pos - robot_pos
             # normal = normal / np.linalg.norm(normal)
@@ -238,6 +242,24 @@ class detect_faces(Node):
             marker.pose.position.y = float(p1[1] + normal[1])
             marker.pose.position.z = float(p1[2] + normal[2])
             self.marker_pub.publish(marker)
+
+            if self.cv_image is not None:
+                # use face bounding box - you need the rect, not just center
+                # assuming self.faces stores (x, y) center, crop a fixed region around it
+                pad = 50
+                h, w = self.cv_image.shape[:2]
+                x1 = max(0, x - pad)
+                x2 = min(w, x + pad)
+                y1 = max(0, y - pad)
+                y2 = min(h, y + pad)
+                face_crop = self.cv_image[y1:y2, x1:x2]
+                try:
+                    img_msg = self.bridge.cv2_to_imgmsg(face_crop, encoding="bgr8")
+                    img_msg.header.stamp = data.header.stamp
+                    img_msg.header.frame_id = "oakd_rgb_camera_optical_frame"
+                    self.face_img_pub.publish(img_msg)
+                except Exception as e:
+                    self.get_logger().warn(f"Face image publish failed: {e}")
 
 
 def main():

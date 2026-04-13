@@ -59,6 +59,7 @@ class State(Enum):
     SEARCHING = auto()
     MOVING_TO_FACE = auto()
     # POZDRAVLJANJE = auto()
+    SPINNING = auto()
     KONCAL = auto()
 
 
@@ -92,11 +93,15 @@ class RobotCommander(Node):
         waypoint_file = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "waypoints.yaml"
         )
+
+        print(waypoint_file)
         if os.path.exists(waypoint_file):
             with open(waypoint_file) as f:
                 data = yaml.safe_load(f)
                 self.waypoints = data.get("waypoints", [])
             self.info(f"Loaded {len(self.waypoints)} waypoints")
+
+        print(self.waypoints)
 
         self.create_subscription(
             DockStatus, "dock_status", self._dockCallback, qos_profile_sensor_data
@@ -163,6 +168,9 @@ class RobotCommander(Node):
             if self.state == State.MOVING_TO_FACE:
                 self.update_moving_to_face()
 
+            if self.state == State.SPINNING:
+                self.update_spinning()
+
             for i, face in enumerate(self.detected_faces):
                 marker = Marker()
                 marker.header.frame_id = "map"
@@ -186,10 +194,19 @@ class RobotCommander(Node):
         if not self.isTaskComplete():
             self.info("waiting to detect face")
             return
+
+        # arrived at waypoint, spin if needed
         if self.pending_spin is not None:
-            self.doSpin(self.pending_spin)
+            spin_angle = self.pending_spin
             self.pending_spin = None
-            self.state = State.SEARCHING
+            self.doSpin(spin_angle)
+            return
+
+        if self.visited_face_i == 3 and len(self.detected_rings) == 2:
+            self.state = State.KONCAL
+            self.info("Finished checking all! :3")
+            self.prisel_sem()
+            return
 
         if self.visited_face_i < len(self.detected_faces):
             self.state = State.MOVING_TO_FACE
@@ -209,10 +226,7 @@ class RobotCommander(Node):
             self.publish_goal_marker(float(pos[0]), float(pos[1]))
             self.visited_face_i += 1
             self.goToPose(goal_pose)
-
-        if self.visited_face_i == 3 and len(self.detected_rings) == 2:
-            self.state = State.KONCAL
-            self.info("Finished checking all! :3")
+            return
 
         if self.waypoint_i < len(self.waypoints):
             wp = self.waypoints[self.waypoint_i]
@@ -227,17 +241,16 @@ class RobotCommander(Node):
             goal_pose.pose.orientation = self.YawToQuaternion(float(wp.get("yaw", 0.0)))
             self.publish_goal_marker(float(wp["x"]), float(wp["y"]))
             self.goToPose(goal_pose)
-
             if wp.get("spin", False):
                 self.pending_spin = float(wp.get("spin_angle", 6.28))
-            else:
-                self.pending_spin = None
+            return
 
     def update_moving_to_face(self):
         if not self.isTaskComplete():
             self.info("waiting to reach face")
             return
-        self.pozdravi()
+        if self.getResult() == TaskResult.SUCCEEDED:
+            self.pozdravi()
         self.state = State.SEARCHING
 
     def pozdravi(self):
@@ -246,14 +259,32 @@ class RobotCommander(Node):
             os.path.dirname(os.path.abspath(__file__)), "greeting.wav"
         )
         model.generate_to_file("Alo Stari!", wav_path, voice="Jasper", speed=1.0)
-        os.system(f"ffplay -nodisp -autoexit {wav_path} 2>/dev/null")
+        subprocess.Popen(
+            ["ffplay", "-nodisp", "-autoexit", wav_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
     def say_color(self, color):
         model = KittenTTS()
-        wav_path = "/tmp/ring.wav"
+        wav_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ring.wav")
 
-        model.generate_to_file(f"{color}", wav_path, voice="Jasper", speed=1.0)
+        model.generate_to_file(f"{color} ring", wav_path, voice="Jasper", speed=1.0)
 
+        subprocess.Popen(
+            ["ffplay", "-nodisp", "-autoexit", wav_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def prisel_sem(self):
+        model = KittenTTS()
+        wav_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "prihajanje.wav"
+        )
+        model.generate_to_file(
+            f"prisel semmmmmmmmmmm", wav_path, voice="Rosie", speed=0.5
+        )
         subprocess.Popen(
             ["ffplay", "-nodisp", "-autoexit", wav_path],
             stdout=subprocess.DEVNULL,
@@ -263,6 +294,27 @@ class RobotCommander(Node):
     def destroy(self):
         self.nav_to_pose_client.destroy()
         super().destroy_node()
+
+    def update_spinning(self):
+        if not self.isTaskComplete():
+            return
+        self.state = State.SEARCHING
+
+    def doSpin(self, angle):
+        self.info(f"Spinning {angle:.2f} rad")
+        while not self.spin_client.wait_for_server(timeout_sec=1.0):
+            self.info("Waiting for spin action server...")
+        goal = Spin.Goal()
+        goal.target_yaw = angle
+        future = self.spin_client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, future)
+        handle = future.result()
+        if not handle.accepted:
+            self.warn("Spin goal rejected")
+            self.state = State.SEARCHING
+            return
+        self.result_future = handle.get_result_async()
+        self.state = State.SPINNING
 
     def goToPose(self, pose, behavior_tree=""):
         """Send a `NavToPose` action request."""
@@ -439,6 +491,13 @@ class RobotCommander(Node):
 
         self.info("faceposcallback called")
 
+        robot_pos = np.array(
+            [self.current_pose.pose.position.x, self.current_pose.pose.position.y, 0.0]
+        )
+        if np.linalg.norm(pos - robot_pos) > 2.5:
+            self.info(f"rejected: too far ({np.linalg.norm(pos - robot_pos):.2f}m)")
+            return
+
         if any(np.linalg.norm(pos - f["pos"]) < 0.5 for f in self.detected_faces):
             self.info("this person has already been detected")
             return  # already detected
@@ -517,7 +576,7 @@ class RobotCommander(Node):
             self.detected_rings.append(
                 {"pos": candidate["pos"].copy(), "color": candidate["color"]}
             )
-            self.detected_ring_candidates.pop()
+            self.detected_ring_candidates.pop(i)
             self.info(f"CONFIRMED ring: {color}")
             self.say_color(f"{color}")
 

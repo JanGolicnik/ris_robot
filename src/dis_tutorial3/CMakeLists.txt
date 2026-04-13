@@ -32,4 +32,8 @@ install(PROGRAMS
   scripts/robot_commander.py
   DESTINATION lib/${PROJECT_NAME})
 
+install(FILES waypoints.yaml
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_package()

@@ -1,0 +1,1 @@
+ros2 run dis_tutorial5 detect_rings.py
