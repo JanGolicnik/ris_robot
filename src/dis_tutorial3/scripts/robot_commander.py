@@ -578,7 +578,7 @@ class RobotCommander(Node):
             )
             self.detected_ring_candidates.pop(i)
             self.info(f"CONFIRMED ring: {color}")
-            self.say_color(f"{color}")
+            self.say_color(candidate["color"])
 
     def _feedbackCallback(self, msg):
         self.debug("Received action feedback message")
