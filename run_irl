@@ -1,0 +1,1 @@
+ros2 launch turtlebot4_navigation localization.launch.py map:=prava_mapa.yaml

@@ -1,0 +1,1 @@
+ros2 launch turtlebot4_navigation nav2.launch.py params_file:="/home/jan/Faks/drugi_letnik/drugi_semester/ris/workspace/nav2.yaml"
