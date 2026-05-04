@@ -32,7 +32,7 @@ from geometry_msgs.msg import (
 )
 from irobot_create_msgs.action import Dock, Undock
 from irobot_create_msgs.msg import DockStatus
-from kittentts import KittenTTS
+# from kittentts import KittenTTS  - for the simulation, now uses topic
 from lifecycle_msgs.srv import GetState
 from nav2_msgs.action import NavigateToPose, Spin
 from rclpy.action import ActionClient
@@ -46,6 +46,7 @@ from rclpy.qos import (
 )
 from turtle_tf2_py.turtle_tf2_broadcaster import quaternion_from_euler
 from visualization_msgs.msg import Marker
+from std_msgs.msg import String
 
 
 class TaskResult(Enum):
@@ -146,6 +147,8 @@ class RobotCommander(Node):
         self.spin_client = ActionClient(self, Spin, "spin")
         self.undock_action_client = ActionClient(self, Undock, "undock")
         self.dock_action_client = ActionClient(self, Dock, "dock")
+
+        self.tts_pub = self.create_publisher(String, "/speak", 10)
 
         self.get_logger().info(f"Robot commander has been initialized!")
 
@@ -254,28 +257,35 @@ class RobotCommander(Node):
         self.state = State.SEARCHING
 
     def pozdravi(self):
-        model = KittenTTS()
-        wav_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "greeting.wav"
-        )
-        model.generate_to_file("Alo Stari!", wav_path, voice="Jasper", speed=1.0)
-        subprocess.Popen(
-            ["ffplay", "-nodisp", "-autoexit", wav_path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        # model = KittenTTS()
+        # wav_path = os.path.join(
+        #     os.path.dirname(os.path.abspath(__file__)), "greeting.wav"
+        # )
+        # model.generate_to_file("Alo Stari!", wav_path, voice="Jasper", speed=1.0)
+        # subprocess.Popen(
+        #     ["ffplay", "-nodisp", "-autoexit", wav_path],
+        #     stdout=subprocess.DEVNULL,
+        #     stderr=subprocess.DEVNULL,
+        # )
+        msg = String()
+        msg.data = "{color}"
+        self.tts_pub.publish(msg)
+
 
     def say_color(self, color):
-        model = KittenTTS()
-        wav_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ring.wav")
+        # model = KittenTTS()
+        # wav_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ring.wav")
 
-        model.generate_to_file(f"{color} ring", wav_path, voice="Jasper", speed=1.0)
+        # model.generate_to_file(f"{color} ring", wav_path, voice="Jasper", speed=1.0)
 
-        subprocess.Popen(
-            ["ffplay", "-nodisp", "-autoexit", wav_path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        # subprocess.Popen(
+        #     ["ffplay", "-nodisp", "-autoexit", wav_path],
+        #     stdout=subprocess.DEVNULL,
+        #     stderr=subprocess.DEVNULL,
+        # )
+        msg = String()
+        msg.data = "Alo stari!"
+        self.tts_pub.publish(msg)
 
     def prisel_sem(self):
         model = KittenTTS()
