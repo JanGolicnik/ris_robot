@@ -47,13 +47,13 @@ class detect_faces(Node):
 
         self.rgb_image_sub = self.create_subscription(
             Image,
-            "/oakd/rgb/preview/image_raw",
+            "/gemini/color/image_raw",
             self.rgb_callback,
             qos_profile_sensor_data,
         )
         self.pointcloud_sub = self.create_subscription(
             PointCloud2,
-            "/oakd/rgb/preview/depth/points",
+            "/gemini/depth/image_raw",
             self.pointcloud_callback,
             qos_profile_sensor_data,
         )
@@ -142,7 +142,9 @@ class detect_faces(Node):
         a = pc2.read_points_numpy(data, field_names=("x", "y", "z"))
         a = a.reshape((height, width, 3))
 
-        print("POINTCLOUD")
+        # da dobimo depth rabmo x y v image space dat v (x, y, 1) pa pomnozit z K^-1 iz /image_data topica
+        # pol pa se poslt cez tf_buffer
+
         for x, y in self.faces:
             d = a[y, x, :]
             d2 = a[max(y - 7, 0), max(x - 7, 0)]
@@ -153,17 +155,17 @@ class detect_faces(Node):
 
             p1_base = PointStamped()
             p1_base.header.frame_id = "oakd_rgb_camera_optical_frame"
+            p1_base.point.x = float(d)
+            p1_base.point.y = float(d)
+            p1_base.point.z = float(d)
             p1_base.header.stamp = data.header.stamp 
-            p1_base.point.x = float(d[0])
-            p1_base.point.y = float(d[1])
-            p1_base.point.z = float(d[2])
 
             p2_base = PointStamped()
             p2_base.header.frame_id = "oakd_rgb_camera_optical_frame"
+            p2_base.point.x = float(d2)
+            p2_base.point.y = float(d2)
+            p2_base.point.z = float(d2)
             p2_base.header.stamp = data.header.stamp
-            p2_base.point.x = float(d2[0])
-            p2_base.point.y = float(d2[1])
-            p2_base.point.z = float(d2[2])
 
             try:
                 p1_map = self.tf_buffer.transform(
@@ -227,9 +229,9 @@ class detect_faces(Node):
             marker.color.g = 1.0
             marker.color.b = 1.0
             marker.color.a = 1.0
-            marker.pose.position.x = float(d[0])
-            marker.pose.position.y = float(d[1])
-            marker.pose.position.z = float(d[2])
+            marker.pose.position.x = float(d)
+            marker.pose.position.y = float(d)
+            marker.pose.position.z = float(d)
             self.marker_pub.publish(marker)
             marker.header.frame_id = "/map"
             marker.id = 1
