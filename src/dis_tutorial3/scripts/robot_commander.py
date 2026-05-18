@@ -57,10 +57,14 @@ class TaskResult(Enum):
 
 
 class State(Enum):
-    SEARCHING = auto()
-    MOVING_TO_FACE = auto()
-    # POZDRAVLJANJE = auto()
-    SPINNING = auto()
+    SEARCHING = auto() # waypointi
+    MOVING_TO_FACE = auto() # gre do detected face
+    DIALOG = auto() # ko se pogovarja
+    APPROACHING_BARREL = auto()
+    INSPECTING_BARREL = auto()
+    APPROACHING_CELL = auto()
+    INSPECTING_CELL = auto()
+    GENERATE_REPORT = auto()
     KONCAL = auto()
 
 
