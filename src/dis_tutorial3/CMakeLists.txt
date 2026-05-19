@@ -28,7 +28,9 @@ install(DIRECTORY
 )
 
 install(PROGRAMS
+  scripts/forward_images.py
   scripts/detect_people.py
+  scripts/detect_rings.py
   scripts/robot_commander.py
   DESTINATION lib/${PROJECT_NAME})
 
