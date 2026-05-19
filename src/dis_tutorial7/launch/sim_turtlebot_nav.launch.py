@@ -31,13 +31,12 @@ ARGUMENTS = [
                           description='Robot namespace'),
     DeclareLaunchArgument('rviz', default_value='true',
                           choices=['true', 'false'], description='Start rviz.'),
-    DeclareLaunchArgument('world', default_value='task1',
+    DeclareLaunchArgument('world', default_value='task2_blue_demo',
                           description='Ignition World'),
     DeclareLaunchArgument('model', default_value='standard',
                           choices=['standard', 'lite'],
                           description='Turtlebot4 Model'),
-    DeclareLaunchArgument('map', default_value=PathJoinSubstitution(
-                          [pkg_dis_tutorial3, 'maps', 'map.yaml']),
+    DeclareLaunchArgument('map', default_value='torture_map.yaml',
                           description='Full path to map yaml file to load'),
 ]
 
