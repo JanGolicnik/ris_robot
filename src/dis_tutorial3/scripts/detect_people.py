@@ -51,14 +51,14 @@ class detect_faces(Node):
 
         self.rgb_sub = self.create_subscription(
             Image,
-            "/robot_rgb_image",
+            "/gemini/color/image_raw",
             self.rgb_callback,
             qos,
         )
 
         self.depth_sub = self.create_subscription(
             Image,
-            "/robot_depth_image",
+            "/gemini/depth/image_raw",
             self.depth_callback,
             qos,
         )

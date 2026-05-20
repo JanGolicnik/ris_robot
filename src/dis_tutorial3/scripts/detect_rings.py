@@ -40,12 +40,11 @@ class RingDetector(Node):
     def __init__(self):
         super().__init__("ring_detector")
 
-        self.ecc_thr = 100
+        self.ecc_thr = 200
+        self.min_ecc_thr = 30
         self.ratio_thr = 2
         self.center_thr = 8
 
-        # Initialise all latched state up front so the first detection
-        # before any callback has fired can't trip an AttributeError.
         self.depth_image = None
         self.camera_info = None
         self.pointcloud = None
@@ -59,7 +58,6 @@ class RingDetector(Node):
         self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=10.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        # Match the relay's publish QoS, otherwise the subscription silently drops.
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
@@ -67,24 +65,16 @@ class RingDetector(Node):
         )
 
         self.image_sub = self.create_subscription(
-            Image, "/robot_rgb_image", self.image_callback, sensor_qos
+            Image, "/gemini/color/image_raw", self.image_callback, sensor_qos
         )
         self.depth_sub = self.create_subscription(
-            Image, "/robot_depth_image", self.depth_callback, sensor_qos
+            Image, "/gemini/depth/image_raw", self.depth_callback, sensor_qos
         )
         self.camera_info_sub = self.create_subscription(
             CameraInfo,
             "/gemini/color/camera_info",
             self.camera_info_callback,
             10,
-        )
-        # Pointcloud path is no longer used by get_3d_position but kept wired
-        # so the subscription doesn't need re-adding if it ever comes back.
-        self.pointcloud_sub = self.create_subscription(
-            PointCloud2,
-            "/oakd/rgb/preview/depth/points",
-            self.pointcloud_callback,
-            qos_profile_sensor_data,
         )
 
         self.ring_pub = self.create_publisher(
@@ -188,16 +178,12 @@ class RingDetector(Node):
         return z if 0.1 < z < 10.0 else None
 
     def get_3d_position(self, ellipse, header):
-        """Localise the ring centre using depth + intrinsics, mirroring the
-        face detector's pattern. `header` should be the RGB image header
-        whose stamp drives the TF lookup."""
         if self.fx is None or self.depth_image is None:
             return None
 
         u = int(ellipse[0][0])
         v = int(ellipse[0][1])
 
-        # Sample depth along the ring perimeter, not at the (hollow) centre.
         z = self.get_ring_depth(self.depth_image, ellipse)
         if z is None:
             return None
@@ -274,37 +260,49 @@ class RingDetector(Node):
         marker.lifetime.sec = 30
         self.marker_pub.publish(marker)
 
-    def get_contours(self, gray, depth):
-        # gray[depth == 0] = 178
-        thresh = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 15, 10
+    def get_contours(self, image):
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        _, s, v = cv2.split(hsv)
+
+        v = cv2.morphologyEx(v, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+        # cv2.imshow("AAAA", s)
+
+        v_blur = cv2.GaussianBlur(v, (5, 5), 0)
+
+        s[s < 90] = 0
+        s_blur = cv2.GaussianBlur(s, (9, 9), 0)
+        s_blur = cv2.adaptiveThreshold(
+            s_blur,
+            255,
+            cv2.ADAPTIVE_THRESH_MEAN_C,
+            cv2.THRESH_BINARY,
+            blockSize=31,  # > rim thickness, < full ring
+            C=-10,  # negative → looser, picks up moderately saturated rings
         )
+        s_blur = cv2.morphologyEx(s_blur, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+        s_blur = cv2.morphologyEx(s_blur, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+        # cv2.imshow("value", v_blur)
+        # cv2.imshow("saturation", s_blur)
+
+        edges_v = cv2.Canny(v_blur, 60, 120)
+        edges_s = cv2.Canny(s_blur, 60, 120)
+        edges = cv2.bitwise_or(edges_v, edges_s)
+
         kernel = np.ones((3, 3), np.uint8)
-        thresh = cv2.erode(thresh, kernel, iterations=1)
-        thresh = cv2.dilate(thresh, kernel, iterations=3)
-        _, global_thresh = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY)
-        thresh = cv2.bitwise_and(thresh, global_thresh)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        # edges_v = cv2.morphologyEx(edges_v, cv2.MORPH_CLOSE, kernel, iterations=1)
+        # edges_s = cv2.morphologyEx(edges_s, cv2.MORPH_CLOSE, kernel, iterations=1)
 
+        # cv2.imshow("v", edges_v)
+        # cv2.imshow("s", edges_s)
+        # cv2.imshow("c", edges)
+
+        # contours_v, _ = cv2.findContours(edges_v, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        # contours_s, _ = cv2.findContours(edges_s, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        # return contours_v + contours_s
+
+        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=1)
+        contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
         return contours
-
-        # cv2.imshow("aada", thresh)
-        # depth[depth == 0] = np.nan
-        # d_min, d_max = np.nanmin(depth), np.nanmax(depth)
-        # depth_u8 = np.zeros(depth.shape, dtype=np.uint8)
-        # if d_max > d_min:
-        #     depth_u8 = ((depth - d_min) / (d_max - d_min) * 255).astype(np.uint8)
-        # depth_u8 = np.nan_to_num(depth_u8, nan=0).astype(np.uint8)
-
-        # thresh_depth = cv2.adaptiveThreshold(
-        #     depth_u8, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 15, 10
-        # )
-        # thresh_depth[depth_u8 == 0] = 0
-        # thresh_depth = cv2.erode(thresh_depth, kernel, iterations=1)
-        # thresh_depth = cv2.dilate(thresh_depth, kernel, iterations=2)
-        # cnts, _ = cv2.findContours(thresh_depth, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-
-        # return contours + cnts
 
     def fit_ellipses(self, contours):
         elps = []
@@ -320,7 +318,12 @@ class RingDetector(Node):
             a, b = max(axes), min(axes)
             b = max(b, 0.0001)
             ratio = a / b
-            if ratio <= self.ratio_thr and a < self.ecc_thr and b < self.ecc_thr:
+            if (
+                ratio <= self.ratio_thr
+                and a < self.ecc_thr
+                and b < self.ecc_thr
+                and b > self.min_ecc_thr
+            ):
                 elps.append(ellipse)
 
         return elps
@@ -328,12 +331,12 @@ class RingDetector(Node):
     def find_ring_candidates(self, elps):
         candidates = []
         for n in range(len(elps)):
+            e1 = elps[n]
             for m in range(n + 1, len(elps)):
-                e1, e2 = elps[n], elps[m]
+                e2 = elps[m]
 
                 dist = np.hypot(e1[0][0] - e2[0][0], e1[0][1] - e2[0][1])
                 if dist >= self.center_thr:
-                    self.get_logger().debug("center thr")
                     continue
 
                 if e1[1][0] >= e2[1][0] and e1[1][1] >= e2[1][1]:
@@ -341,19 +344,19 @@ class RingDetector(Node):
                 elif e2[1][0] >= e1[1][0] and e2[1][1] >= e1[1][1]:
                     le, se = e2, e1
                 else:
-                    self.get_logger().debug("ecc")
+                    print("ecc")
                     continue
 
                 major_ratio = se[1][1] / le[1][1]
                 minor_ratio = se[1][0] / le[1][0]
 
                 if abs(major_ratio - minor_ratio) > 0.3:
-                    self.get_logger().debug("ratio")
+                    print("ratio")
                     continue
 
-                if not (0.4 < major_ratio < 0.85):
-                    self.get_logger().debug("ratio2")
-                    continue
+                # if not (0.4 < major_ratio < 0.85):
+                #     print("ratio2")
+                #     continue
 
                 candidates.append((le, se))
 
@@ -383,26 +386,26 @@ class RingDetector(Node):
         return abs(float(np.mean(valid)) - ring_depth) > 0.1
 
     def image_callback(self, data):
+        print("got image")
         if self.depth_image is None:
             return
 
-        depth = self.depth_image.copy()
-
         try:
-            cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
+            color_img = self.bridge.imgmsg_to_cv2(data, "bgr8")
+            # cv2.imshow("depth", self.depth_image)
         except CvBridgeError as e:
             self.get_logger().error(str(e))
             return
 
-        # cv_image, depth = self.remove_pole(cv_image, depth)
-        gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
-
-        contours = self.get_contours(gray, depth)
-        cv2.drawContours(gray, contours, -1, (255, 0, 0), 1)
-        cv2.imshow("Detected contours", gray)
-        # cv2.imshow("Detected contours", gray)
+        contours = self.get_contours(color_img)
+        cv2.drawContours(color_img, contours, -1, (255, 0, 0), 1)
 
         elps = self.fit_ellipses(contours)
+
+        for e in elps:
+            cv2.ellipse(color_img, e, (255, 255, 0), 1)
+
+        # cv2.imshow("Detected contours", color_img)
 
         candidates = self.find_ring_candidates(elps)
         candidates = [c for c in candidates if self.check_hollow(c)]
@@ -410,17 +413,15 @@ class RingDetector(Node):
         self.get_logger().info(f"Found {len(candidates)} ring candidates")
 
         for le, se in candidates:
-            color = self.get_ring_color(cv_image, (le, se))
+            color = self.get_ring_color(color_img, (le, se))
             cx, cy = int(le[0][0]), int(le[0][1])
             pos = self.get_3d_position(le, data.header)
 
             if pos is not None:
                 self.publish_ring(pos, color, data.header.stamp)
 
-            cv2.ellipse(cv_image, le, (0, 255, 0), 2)
-            cv2.ellipse(cv_image, se, (0, 255, 0), 2)
             cv2.putText(
-                cv_image,
+                color_img,
                 color,
                 (cx, cy),
                 cv2.FONT_HERSHEY_SIMPLEX,
@@ -429,10 +430,7 @@ class RingDetector(Node):
                 1,
             )
 
-        for e in elps:
-            cv2.ellipse(cv_image, e, (255, 0, 0), 1)
-
-        # cv2.imshow("Detected rings", cv_image)
+        cv2.imshow("Detected rings", color_img)
         cv2.waitKey(1)
 
     def depth_callback(self, data):
@@ -442,8 +440,6 @@ class RingDetector(Node):
             self.get_logger().error(str(e))
             return
 
-        # Normalise to float32 metres regardless of incoming encoding,
-        # so downstream code is unit-agnostic to the underlying camera.
         if raw.dtype == np.uint16:
             depth_image = raw.astype(np.float32) / 1000.0
         else:
@@ -451,9 +447,6 @@ class RingDetector(Node):
 
         depth_image[~np.isfinite(depth_image)] = 0
         self.depth_image = depth_image
-
-    def pointcloud_callback(self, data):
-        self.pointcloud = data
 
 
 def main():

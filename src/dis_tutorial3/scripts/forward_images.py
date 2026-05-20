@@ -39,7 +39,7 @@ class detect_faces(Node):
                 ),
             ],
             queue_size=10,
-            slop=0.75,
+            slop=2.0,
         )
 
         self.sync.registerCallback(self.images_callback)
