@@ -13,19 +13,14 @@ from sensor_msgs.msg import Image, PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
 from visualization_msgs.msg import Marker
 
-
-# HSV ranges for barrel colors. Tune these by checking actual colors in sim.
 COLOR_RANGES = {
     "red":    [(np.array([0, 100, 50]),   np.array([10, 255, 255])),
                (np.array([170, 100, 50]), np.array([180, 255, 255]))],
     "green":  [(np.array([40, 80, 50]),   np.array([80, 255, 255]))],
     "blue":   [(np.array([100, 100, 50]), np.array([130, 255, 255]))],
     "yellow": [(np.array([20, 100, 100]), np.array([35, 255, 255]))],
-    "purple": [(np.array([130, 50, 50]),  np.array([160, 255, 255]))],
-    "orange": [(np.array([10, 150, 100]), np.array([20, 255, 255]))],
-    "brown":  [(np.array([5, 80, 30]),    np.array([20, 200, 150]))],
+    "black": [(np.array([0, 0, 0]), np.array([180, 255, 50]))]
 }
-
 
 class BarrelDetector(Node):
     def __init__(self):
@@ -78,27 +73,44 @@ class BarrelDetector(Node):
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             for cnt in contours:
                 area = cv2.contourArea(cnt)
-                if area < 800:  # too small, probably noise
+                if area < 800:
                     continue
 
                 x, y, w, h = cv2.boundingRect(cnt)
+
+                fill = area / (h * w)
+                if fill < 0.6:
+                    continue
+
                 aspect = h / w if w > 0 else 0
 
-                # vertical barrel: tall and narrow (aspect > 1.3)
-                # horizontal barrel: wide and short (aspect < 0.8)
-                # everything in between is probably partial view or false positive
                 if aspect > 1.3:
                     orientation = "vertical"
                 elif aspect < 0.8:
                     orientation = "horizontal"
                 else:
-                    continue  # ambiguous, skip
+                    continue
 
                 cx = x + w // 2
                 cy = y + h // 2
+
+                roi = hsv[y:y+h, x:x+w]
+
+                cnt_mask = np.zeros(mask.shape, np.uint8)
+                cv2.drawContours(cnt_mask, [cnt], -1, 255, -1)
+                roi_mask = cnt_mask[y:y+h, x:x+w]
+
+                hue_pixels = roi[:, :, 0][roi_mask == 255]
+
+                if len(hue_pixels) < 50:
+                    continue
+
+                hue_std = np.std(hue_pixels)
+                if hue_std > 15:
+                    continue
+
                 self.candidates_in_image.append((cx, cy, color, orientation))
 
-                # draw for debugging
                 cv2.rectangle(cv_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
                 cv2.putText(cv_image, f"{color} {orientation}",
                             (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
@@ -137,7 +149,6 @@ class BarrelDetector(Node):
                 self.get_logger().warn(f"TF transform failed: {e}")
                 continue
 
-            # publish position, abuse header.frame_id to encode color + orientation
             pose = PoseStamped()
             pose.header.frame_id = f"{color}:{orientation}"
             pose.header.stamp = self.get_clock().now().to_msg()
