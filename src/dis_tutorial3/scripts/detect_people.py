@@ -153,24 +153,24 @@ class detect_faces(Node):
 
             p1_base = PointStamped()
             p1_base.header.frame_id = "oakd_rgb_camera_optical_frame"
-            p1_base.header.stamp = data.header.stamp 
+            p1_base.header.stamp = rclpy.time.Time().to_msg() 
             p1_base.point.x = float(d[0])
             p1_base.point.y = float(d[1])
             p1_base.point.z = float(d[2])
 
             p2_base = PointStamped()
             p2_base.header.frame_id = "oakd_rgb_camera_optical_frame"
-            p2_base.header.stamp = data.header.stamp
+            p2_base.header.stamp = rclpy.time.Time().to_msg()
             p2_base.point.x = float(d2[0])
             p2_base.point.y = float(d2[1])
             p2_base.point.z = float(d2[2])
 
             try:
                 p1_map = self.tf_buffer.transform(
-                    p1_base, "map", timeout=rclpy.duration.Duration(seconds=0.1)
+                    p1_base, "map", timeout=rclpy.duration.Duration(seconds=0.5)
                 )
                 p2_map = self.tf_buffer.transform(
-                    p2_base, "map", timeout=rclpy.duration.Duration(seconds=0.1)
+                    p2_base, "map", timeout=rclpy.duration.Duration(seconds=0.9)
                 )
                 # tf = self.tf_buffer.lookup_transform("map", "base_link", Time())
             except Exception as e:
