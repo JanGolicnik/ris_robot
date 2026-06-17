@@ -2,37 +2,48 @@
 
 import math
 import os
+import subprocess
 import time
 from enum import Enum, auto
+
 import cv2
 import numpy as np
 import rclpy
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Quaternion
-from rclpy.node import Node
-from rclpy.qos import (
-    QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
-    QoSReliabilityPolicy, qos_profile_sensor_data,
-)
-from std_msgs.msg import String
-from visualization_msgs.msg import Marker
 from action_msgs.msg import GoalStatus
+from anomaly_detector import AnomalyDetector
+from cv_bridge import CvBridge
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Quaternion
+from kittentts import KittenTTS
 from nav2_msgs.action import NavigateToPose, Spin
 from rclpy.action import ActionClient
-from turtle_tf2_py.turtle_tf2_broadcaster import quaternion_from_euler
-from anomaly_detector import AnomalyDetector
+from rclpy.node import Node
+from rclpy.qos import (
+    QoSDurabilityPolicy,
+    QoSHistoryPolicy,
+    QoSProfile,
+    QoSReliabilityPolicy,
+    qos_profile_sensor_data,
+)
 from sensor_msgs.msg import Image
-from cv_bridge import CvBridge
+from std_msgs.msg import String
+from turtle_tf2_py.turtle_tf2_broadcaster import quaternion_from_euler
+from visualization_msgs.msg import Marker
+
+from dis_tutorial3_interfaces.msg import FaceDetection
+
 
 class State(Enum):
     SEARCHING = auto()
     MOVING_TO_FACE = auto()
     SPINNING = auto()
 
+
 class TaskResult(Enum):
     UNKNOWN = 0
     SUCCEEDED = 1
     CANCELED = 2
     FAILED = 3
+
 
 class RobotCommander(Node):
     def __init__(self):
@@ -56,7 +67,8 @@ class RobotCommander(Node):
         self.latest_top_image = None
 
         self.create_subscription(
-            PoseWithCovarianceStamped, "amcl_pose",
+            PoseWithCovarianceStamped,
+            "amcl_pose",
             self._amclPoseCallback,
             QoSProfile(
                 durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
@@ -66,29 +78,35 @@ class RobotCommander(Node):
             ),
         )
         self.create_subscription(
-            PoseStamped, "/face_positions",
+            FaceDetection,
+            "/face_detections",
             self._facePosCallback,
             QoSProfile(depth=10, reliability=QoSReliabilityPolicy.BEST_EFFORT),
         )
         self.create_subscription(
-            PoseStamped, "/ring_positions",
+            PoseStamped,
+            "/ring_positions",
             self._ringCallback,
             QoSProfile(depth=10, reliability=QoSReliabilityPolicy.BEST_EFFORT),
         )
         self.create_subscription(
-            PoseStamped, "/barrel_positions",
+            PoseStamped,
+            "/barrel_positions",
             self._barrelCallback,
             QoSProfile(depth=10, reliability=QoSReliabilityPolicy.BEST_EFFORT),
         )
-        self.create_subscription( #top arm kamera
-            Image,
-            "/top_camera/rgb/preview/image_raw",
-            self.top_camera_callback,
-            10
+        self.create_subscription(  # top arm kamera
+            Image, "/top_camera/rgb/preview/image_raw", self.top_camera_callback, 10
         )
-        self.face_marker_pub = self.create_publisher(Marker, "/detected_face_marker", 10)
-        self.ring_marker_pub = self.create_publisher(Marker, "/detected_ring_marker", 10)
-        self.barrel_marker_pub = self.create_publisher(Marker, "/detected_barrel_marker", 10)
+        self.face_marker_pub = self.create_publisher(
+            Marker, "/detected_face_marker", 10
+        )
+        self.ring_marker_pub = self.create_publisher(
+            Marker, "/detected_ring_marker", 10
+        )
+        self.barrel_marker_pub = self.create_publisher(
+            Marker, "/detected_barrel_marker", 10
+        )
 
         self.info("Robot commander initialized (manual mode)")
 
@@ -114,7 +132,7 @@ class RobotCommander(Node):
             elif self.state == State.SPINNING:
                 self.update_spinning()
             self.publish_detection_markers()
-            self.test_anomaly_detection()
+            # self.test_anomaly_detection()
 
     def update_search(self):
         if not self.isTaskComplete():
@@ -122,9 +140,9 @@ class RobotCommander(Node):
         if self.visited_face_i < len(self.detected_faces):
             self.state = State.MOVING_TO_FACE
             self.info("going towards a face")
-            face = self.detected_faces[self.visited_face_i]
-            pos = face["pos"] + face["normal"]
-            dir = face["pos"] - pos
+            self.current_face = self.detected_faces[self.visited_face_i]
+            pos = self.current_face["pos"] + self.current_face["normal"] * 0.5
+            dir = self.current_face["pos"] - pos
             yaw = math.atan2(dir[1], dir[0])
             goal = PoseStamped()
             goal.header.frame_id = "map"
@@ -139,9 +157,14 @@ class RobotCommander(Node):
     def update_moving_to_face(self):
         if not self.isTaskComplete():
             return
+        face = self.current_face
         if self.getResult() == TaskResult.SUCCEEDED:
-            self.say("Hello there!")
+            foid = face["pronouns"] in ("she/her")
+            self.say(
+                f"hello {face['name']}! you are a {'foid' if foid else 'chud'} {face['job']}"
+            )
         self.state = State.SEARCHING
+        self.current_face = None
 
     def update_spinning(self):
         if not self.isTaskComplete():
@@ -149,9 +172,19 @@ class RobotCommander(Node):
         self.state = State.SEARCHING
 
     def say(self, text):
-        msg = String()
-        msg.data = text
-        self.tts_pub.publish(msg)
+        model = KittenTTS()
+        wav_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "greeting.wav"
+        )
+        model.generate_to_file(text, wav_path, voice="Jasper", speed=1.0)
+        subprocess.Popen(
+            ["ffplay", "-nodisp", "-autoexit", wav_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # msg = String()
+        # msg.data = text
+        # self.tts_pub.publish(msg)
 
     def YawToQuaternion(self, angle_z=0.0):
         q = quaternion_from_euler(0, 0, angle_z)
@@ -195,7 +228,7 @@ class RobotCommander(Node):
             self.status = self.result_future.result().status
             return True
         return False
-    
+
     def test_anomaly_detection(self):
 
         if self.latest_top_image is None:
@@ -205,17 +238,10 @@ class RobotCommander(Node):
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        _, thresh = cv2.threshold(
-            gray,
-            140,
-            255,
-            cv2.THRESH_BINARY
-        )
+        _, thresh = cv2.threshold(gray, 140, 255, cv2.THRESH_BINARY)
 
         contours, _ = cv2.findContours(
-            thresh,
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE
+            thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
 
         if not contours:
@@ -230,10 +256,7 @@ class RobotCommander(Node):
 
         size = int(min(w, h) * 0.8)
 
-        tile = img[
-            cy - size//2 : cy + size//2,
-            cx - size//2 : cx + size//2
-        ]
+        tile = img[cy - size // 2 : cy + size // 2, cx - size // 2 : cx + size // 2]
 
         tile = cv2.resize(tile, (512, 512))
 
@@ -241,13 +264,7 @@ class RobotCommander(Node):
 
         debug = img.copy()
 
-        cv2.rectangle(
-            debug,
-            (x, y),
-            (x+w, y+h),
-            (0, 255, 0),
-            2
-        )
+        cv2.rectangle(debug, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
         if is_anomaly:
             print("NOK")
@@ -263,10 +280,7 @@ class RobotCommander(Node):
         cv2.waitKey(1)
 
     def top_camera_callback(self, msg):
-        self.latest_top_image = self.bridge.imgmsg_to_cv2(
-            msg,
-            "bgr8"
-        )
+        self.latest_top_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
 
     def getResult(self):
         if self.status == GoalStatus.STATUS_SUCCEEDED:
@@ -325,41 +339,62 @@ class RobotCommander(Node):
 
     def _color_to_rgb(self, name):
         return {
-            "red":    (1.0, 0.0, 0.0),
-            "green":  (0.0, 1.0, 0.0),
-            "blue":   (0.0, 0.0, 1.0),
+            "red": (1.0, 0.0, 0.0),
+            "green": (0.0, 1.0, 0.0),
+            "blue": (0.0, 0.0, 1.0),
             "yellow": (1.0, 1.0, 0.0),
             "purple": (0.5, 0.0, 0.5),
             "orange": (1.0, 0.5, 0.0),
-            "brown":  (0.4, 0.2, 0.0),
-            "black":  (0.1, 0.1, 0.1),
+            "brown": (0.4, 0.2, 0.0),
+            "black": (0.1, 0.1, 0.1),
         }.get(name, (0.7, 0.7, 0.7))
 
     def _amclPoseCallback(self, msg):
         self.current_pose = msg.pose
 
     def _facePosCallback(self, msg):
-        pos = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
-        normal = np.array([msg.pose.orientation.x, msg.pose.orientation.y, msg.pose.orientation.z])
+        name = msg.name
+        pronouns = msg.pronouns
+        job = msg.job
+        pos = np.array(
+            [
+                msg.pose.pose.position.x,
+                msg.pose.pose.position.y,
+                msg.pose.pose.position.z,
+            ]
+        )
+        yaw = 2.0 * math.atan2(msg.pose.pose.orientation.z, msg.pose.pose.orientation.w)
+        normal = np.array([math.cos(yaw), math.sin(yaw), 0.0])
         now = time.time()
 
         if self.current_pose is None:
             return
-        robot_pos = np.array([
-            self.current_pose.pose.position.x,
-            self.current_pose.pose.position.y, 0.0
-        ])
+        robot_pos = np.array(
+            [self.current_pose.pose.position.x, self.current_pose.pose.position.y, 0.0]
+        )
         if np.linalg.norm(pos - robot_pos) > 2.5:
             return
 
-        if any(np.linalg.norm(pos - f["pos"]) < 0.5 for f in self.detected_faces):
-            return
+        for f in self.detected_faces:
+            if np.linalg.norm(pos - f["pos"]) < 0.5:
+                f["name"] = name
+                f["job"] = job
+                f["pronouns"] = pronouns
+                return
 
-        i = next((i for i, c in enumerate(self.detected_face_candidates)
-                  if np.linalg.norm(c["pos"] - pos) < 0.5), None)
+        i = next(
+            (
+                i
+                for i, c in enumerate(self.detected_face_candidates)
+                if np.linalg.norm(c["pos"] - pos) < 0.5
+            ),
+            None,
+        )
 
         if i is None:
-            self.detected_face_candidates.append({"pos": pos, "normal": normal, "times": [now]})
+            self.detected_face_candidates.append(
+                {"pos": pos, "normal": normal, "times": [now]}
+            )
             return
 
         c = self.detected_face_candidates[i]
@@ -367,7 +402,18 @@ class RobotCommander(Node):
         c["pos"] = np.mean([c["pos"], pos], axis=0)
         c["times"] = [t for t in c["times"] if now - t < 2.0]
         if len(c["times"]) >= 5:
-            self.detected_faces.append({"pos": c["pos"].copy(), "normal": c["normal"]})
+            n = c["normal"]
+            norm = np.linalg.norm(n)
+            n = n / norm
+            self.detected_faces.append(
+                {
+                    "pos": c["pos"].copy(),
+                    "normal": normal,
+                    "name": name,
+                    "job": job,
+                    "pronouns": pronouns,
+                }
+            )
             self.detected_face_candidates.pop(i)
             self.info(f"CONFIRMED face at {c['pos']}")
 
@@ -379,11 +425,19 @@ class RobotCommander(Node):
         if any(np.linalg.norm(pos - r["pos"]) < 0.5 for r in self.detected_rings):
             return
 
-        i = next((i for i, c in enumerate(self.detected_ring_candidates)
-                  if np.linalg.norm(c["pos"] - pos) < 0.5), None)
+        i = next(
+            (
+                i
+                for i, c in enumerate(self.detected_ring_candidates)
+                if np.linalg.norm(c["pos"] - pos) < 0.5
+            ),
+            None,
+        )
 
         if i is None:
-            self.detected_ring_candidates.append({"pos": pos, "color": color, "times": [now]})
+            self.detected_ring_candidates.append(
+                {"pos": pos, "color": color, "times": [now]}
+            )
             return
 
         c = self.detected_ring_candidates[i]
@@ -406,13 +460,19 @@ class RobotCommander(Node):
         if any(np.linalg.norm(pos - b["pos"]) < 0.5 for b in self.detected_barrels):
             return
 
-        i = next((i for i, c in enumerate(self.detected_barrel_candidates)
-                  if np.linalg.norm(c["pos"] - pos) < 0.5), None)
+        i = next(
+            (
+                i
+                for i, c in enumerate(self.detected_barrel_candidates)
+                if np.linalg.norm(c["pos"] - pos) < 0.5
+            ),
+            None,
+        )
 
         if i is None:
-            self.detected_barrel_candidates.append({
-                "pos": pos, "color": color, "orientation": orientation, "times": [now]
-            })
+            self.detected_barrel_candidates.append(
+                {"pos": pos, "color": color, "orientation": orientation, "times": [now]}
+            )
             return
 
         c = self.detected_barrel_candidates[i]
@@ -420,11 +480,13 @@ class RobotCommander(Node):
         c["pos"] = np.mean([c["pos"], pos], axis=0)
         c["times"] = [t for t in c["times"] if now - t < 2.0]
         if len(c["times"]) >= 5:
-            self.detected_barrels.append({
-                "pos": c["pos"].copy(),
-                "color": c["color"],
-                "orientation": c["orientation"],
-            })
+            self.detected_barrels.append(
+                {
+                    "pos": c["pos"].copy(),
+                    "color": c["color"],
+                    "orientation": c["orientation"],
+                }
+            )
             self.detected_barrel_candidates.pop(i)
             self.info(f"CONFIRMED barrel: {c['color']} {c['orientation']}")
 
@@ -444,6 +506,7 @@ def main(args=None):
         pass
     rc.destroy_node()
     rclpy.shutdown()
+
 
 if __name__ == "__main__":
     main()

@@ -22,3 +22,8 @@ Should do:
 - [x] Defect detection (3 pt)
 - [ ] Dialogue with ASR (2 pts)
 - [ ] Creating the inspection report (1 pt)
+
+
+# installation
+
+``` pip install insightface onnxruntime numpy opencv-python ```
