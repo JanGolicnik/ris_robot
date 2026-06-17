@@ -25,7 +25,7 @@ class AnomalyDetector:
         #pretvori sivinsko sliko v crno belo oz binarno
         _, mask = cv2.threshold(
             blackhat,
-            50,
+            60,
             255,
             cv2.THRESH_BINARY
         )

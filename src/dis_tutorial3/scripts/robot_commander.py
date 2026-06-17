@@ -31,6 +31,7 @@ from visualization_msgs.msg import Marker
 
 from dis_tutorial3_interfaces.msg import FaceDetection
 
+from detect_lines import LineDetector
 
 class State(Enum):
     SEARCHING = auto()
@@ -69,6 +70,10 @@ class RobotCommander(Node):
 
         self.qr = cv2.QRCodeDetector()
 
+        self.line_detector = LineDetector()
+        self.target_line = "yellow" #tuki bomo dal da je red ali green, odvisno kaj oseba rece
+        self.latest_rgb_image = None #normal kamera kt pr face pa to
+
         self.create_subscription(
             PoseWithCovarianceStamped,
             "amcl_pose",
@@ -103,6 +108,12 @@ class RobotCommander(Node):
         )
         self.create_subscription(
             Image, "/oakd/rgb/preview/image_raw", self.front_camera_callback, 10
+        )
+        self.create_subscription(
+            Image,
+            "/oakd/rgb/preview/image_raw",
+            self.rgb_camera_callback,
+            qos_profile_sensor_data
         )
         self.face_marker_pub = self.create_publisher(
             Marker, "/detected_face_marker", 10
@@ -146,7 +157,8 @@ class RobotCommander(Node):
             elif self.state == State.SPINNING:
                 self.update_spinning()
             self.publish_detection_markers()
-            # self.test_anomaly_detection()
+            #self.test_anomaly_detection()
+            self.test_line_detection()
 
     def update_converse(self):
         face = self.current_face
@@ -166,6 +178,7 @@ class RobotCommander(Node):
         self.say(f"Ok i will do the {next_task}")
         self.current_face = None
         self.state = State.SEARCHING
+
 
     def update_search(self):
         if not self.isTaskComplete():
@@ -260,55 +273,98 @@ class RobotCommander(Node):
             self.status = self.result_future.result().status
             return True
         return False
+    
+    # def test_anomaly_detection(self):
 
-    def test_anomaly_detection(self):
+    #     if self.latest_top_image is None:
+    #         return
 
-        if self.latest_top_image is None:
+    #     img = self.latest_top_image.copy()
+
+    #     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    #     _, thresh = cv2.threshold(
+    #         gray,
+    #         140,
+    #         255,
+    #         cv2.THRESH_BINARY
+    #     )
+
+    #     contours, _ = cv2.findContours(
+    #         thresh,
+    #         cv2.RETR_EXTERNAL,
+    #         cv2.CHAIN_APPROX_SIMPLE
+    #     )
+
+    #     if not contours:
+    #         return
+
+    #     largest = max(contours, key=cv2.contourArea)
+
+    #     x, y, w, h = cv2.boundingRect(largest)
+
+    #     cx = x + w // 2
+    #     cy = y + h // 2
+
+    #     size = int(min(w, h) * 0.8)
+
+    #     tile = img[
+    #         cy - size//2 : cy + size//2,
+    #         cx - size//2 : cx + size//2
+    #     ]
+
+    #     tile = cv2.resize(tile, (512, 512))
+
+    #     is_anomaly, mask, blackhat = self.anomaly_detector.detect(tile)
+
+    #     debug = img.copy()
+
+    #     cv2.rectangle(
+    #         debug,
+    #         (x, y),
+    #         (x+w, y+h),
+    #         (0, 255, 0),
+    #         2
+    #     )
+
+    #     if is_anomaly:
+    #         print("NOK")
+    #     else:
+    #         print("OK")
+
+    #     cv2.imshow("top_camera", debug)
+    #     #cv2.imshow("threshold", thresh)
+    #     #cv2.imshow("tile", tile)
+    #     cv2.imshow("mask", mask)
+    #     #cv2.imshow("blackhat", blackhat)
+
+    #     cv2.waitKey(1)
+    
+    def test_line_detection(self):
+        if self.latest_rgb_image is None:
             return
 
-        img = self.latest_top_image.copy()
+        img = self.latest_rgb_image.copy()
 
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        found, cx, cy, angle, mask = \
+            self.line_detector.find_line(
+                img,
+                self.target_line
+            )
 
-        _, thresh = cv2.threshold(gray, 140, 255, cv2.THRESH_BINARY)
+        if found:
+            cv2.circle(
+                img,
+                (cx, cy),
+                10,
+                (0,255,0),
+                -1
+            )
+            print("FOUND", cx, cy, angle)
 
-        contours, _ = cv2.findContours(
-            thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-
-        if not contours:
-            return
-
-        largest = max(contours, key=cv2.contourArea)
-
-        x, y, w, h = cv2.boundingRect(largest)
-
-        cx = x + w // 2
-        cy = y + h // 2
-
-        size = int(min(w, h) * 0.8)
-
-        tile = img[cy - size // 2 : cy + size // 2, cx - size // 2 : cx + size // 2]
-
-        tile = cv2.resize(tile, (512, 512))
-
-        is_anomaly, mask, blackhat = self.anomaly_detector.detect(tile)
-
-        debug = img.copy()
-
-        cv2.rectangle(debug, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-        if is_anomaly:
-            print("NOK")
-        else:
-            print("OK")
-
-        cv2.imshow("top_camera", debug)
-        cv2.imshow("threshold", thresh)
-        cv2.imshow("tile", tile)
-        cv2.imshow("mask", mask)
-        cv2.imshow("blackhat", blackhat)
-
+        cv2.imshow("line",img)
+        cv2.imshow("line_mask",mask)
+        
         cv2.waitKey(1)
 
     def top_camera_callback(self, msg):
@@ -316,6 +372,12 @@ class RobotCommander(Node):
 
     def front_camera_callback(self, msg):
         self.latest_front_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+
+    def rgb_camera_callback(self, msg):
+        self.latest_rgb_image = self.bridge.imgmsg_to_cv2(
+            msg,
+            "bgr8"
+        )
 
     def getResult(self):
         if self.status == GoalStatus.STATUS_SUCCEEDED:
