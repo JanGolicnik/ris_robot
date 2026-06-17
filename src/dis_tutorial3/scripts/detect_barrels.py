@@ -8,19 +8,133 @@ import cv2
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PointStamped, PoseStamped
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data, QoSReliabilityPolicy
+from rclpy.qos import qos_profile_sensor_data, QoSReliabilityPolicy, QoSProfile
 from sensor_msgs.msg import Image, PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
 from visualization_msgs.msg import Marker
 
+#malo na vecje zaradi hi, lo spodaj, zaradi red
 COLOR_RANGES = {
-    "red":    [(np.array([0, 100, 50]),   np.array([10, 255, 255])),
-               (np.array([170, 100, 50]), np.array([180, 255, 255]))],
-    "green":  [(np.array([40, 80, 50]),   np.array([80, 255, 255]))],
-    "blue":   [(np.array([100, 100, 50]), np.array([130, 255, 255]))],
-    "yellow": [(np.array([20, 100, 100]), np.array([35, 255, 255]))],
-    "black": [(np.array([0, 0, 0]), np.array([180, 255, 50]))]
+    "red": [
+        (np.array([0, 100, 50]), np.array([10, 255, 255])),
+        (np.array([170, 100, 50]), np.array([180, 255, 255]))
+    ],
+    "green": [
+        (np.array([40, 50, 50]), np.array([90, 255, 255]))
+    ],
+    "blue": [
+        (np.array([95, 100, 80]), np.array([130, 255, 255]))
+    ],
+    "yellow": [
+        (np.array([18, 80, 80]), np.array([35, 255, 255]))
+    ],
+    "purple": [
+        (np.array([135, 50, 50]), np.array([165, 255, 255]))
+    ],
+    "orange": [
+        (np.array([9, 100, 50]), np.array([17, 255, 255]))
+    ],
+    "brown": [
+        (np.array([10, 80, 30]), np.array([20, 200, 150]))
+    ],
 }
+
+def detect_colored_regions(img_bgr,
+                           min_fill_ratio=0.55,
+                           inner_crop=0.6,
+                           min_contour_area=800,
+                           morph_kernel=(5,5)):
+
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    detections = []
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, morph_kernel)
+
+    for cname, ranges in COLOR_RANGES.items():
+        mask = None
+        for lo, hi in ranges:
+            m = cv2.inRange(hsv, lo, hi)
+            mask = m if mask is None else cv2.bitwise_or(mask, m)
+
+        if mask is None:
+            continue
+
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < min_contour_area:
+                continue
+
+            x, y, w, h = cv2.boundingRect(cnt)
+
+            img_h, img_w = img_bgr.shape[:2]
+
+            margin = 15
+
+            if x < margin or y < margin:
+                continue
+
+            if x + w > img_w - margin:
+                continue
+
+            if y + h > img_h - margin:
+                continue
+
+            if w == 0 or h == 0:
+                continue
+
+            if w > 500 or h > 500:
+                continue
+
+            fill = area / (w * h)
+            if fill < min_fill_ratio:
+                continue
+
+            aspect_wh = float(w) / float(h)
+
+            if aspect_wh > 8 or aspect_wh < 0.125:
+                continue
+
+            if min(w, h) < 20:
+                continue
+
+            cx0 = int(w * (1 - inner_crop) / 2)
+            cy0 = int(h * (1 - inner_crop) / 2)
+            cw = max(1, int(w * inner_crop))
+            ch = max(1, int(h * inner_crop))
+
+            rect_mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.drawContours(rect_mask, [cnt - [x, y]], -1, 255, -1)
+            center_crop = rect_mask[cy0:cy0+ch, cx0:cx0+cw]
+            center_fill = np.count_nonzero(center_crop) / (cw * ch + 1e-9)
+            if center_fill < 0.75:
+                continue
+
+            orientation = "vertical" if h > 1.3 * w else ("horizontal" if w > 1.25 * h else "unknown")
+            if orientation == "unknown":
+                continue
+
+            roi = hsv[y:y+h, x:x+w]
+            roi_mask = rect_mask
+            hue_pixels = roi[:, :, 0][roi_mask == 255]
+            if len(hue_pixels) < 30:
+                continue
+            if np.std(hue_pixels) > 25:
+                continue
+
+            detections.append({
+                "color": cname,
+                "bbox": (x, y, w, h),
+                "area": float(area),
+                "fill_ratio": float(fill),
+                "center_fill": float(center_fill),
+                "orientation": orientation,
+            })
+
+    return detections
 
 class BarrelDetector(Node):
     def __init__(self):
@@ -28,7 +142,7 @@ class BarrelDetector(Node):
 
         self.bridge = CvBridge()
         self.cv_image = None
-        self.candidates_in_image = []  # list of (cx, cy, color, orientation)
+        self.candidates_in_image = []
 
         self.image_sub = self.create_subscription(
             Image, "/oakd/rgb/preview/image_raw",
@@ -39,8 +153,13 @@ class BarrelDetector(Node):
             self.pointcloud_callback, qos_profile_sensor_data
         )
 
+        qos = QoSProfile(depth=10)
+        qos.reliability = QoSReliabilityPolicy.BEST_EFFORT
+
         self.barrel_pub = self.create_publisher(
-            PoseStamped, "/barrel_positions", QoSReliabilityPolicy.BEST_EFFORT
+            PoseStamped,
+            "/barrel_positions",
+            qos
         )
         self.marker_pub = self.create_publisher(Marker, "/barrel_marker", 10)
 
@@ -56,64 +175,21 @@ class BarrelDetector(Node):
             self.get_logger().error(f"cv_bridge error: {e}")
             return
 
-        hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
+        detections = detect_colored_regions(cv_image, min_fill_ratio=0.55, inner_crop=0.6, min_contour_area=800, morph_kernel=(5,5))
+
         self.candidates_in_image = []
+        for det in detections:
+            x, y, w, h = det["bbox"]
+            cx = x + w // 2
+            cy = y + h // 2
+            color = det["color"]
+            orientation = det["orientation"]
 
-        for color, ranges in COLOR_RANGES.items():
-            mask = None
-            for lo, hi in ranges:
-                m = cv2.inRange(hsv, lo, hi)
-                mask = m if mask is None else cv2.bitwise_or(mask, m)
+            self.candidates_in_image.append((cx, cy, color, orientation))
 
-            # cleanup noise
-            kernel = np.ones((5, 5), np.uint8)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for cnt in contours:
-                area = cv2.contourArea(cnt)
-                if area < 800:
-                    continue
-
-                x, y, w, h = cv2.boundingRect(cnt)
-
-                fill = area / (h * w)
-                if fill < 0.6:
-                    continue
-
-                aspect = h / w if w > 0 else 0
-
-                if aspect > 1.3:
-                    orientation = "vertical"
-                elif aspect < 0.8:
-                    orientation = "horizontal"
-                else:
-                    continue
-
-                cx = x + w // 2
-                cy = y + h // 2
-
-                roi = hsv[y:y+h, x:x+w]
-
-                cnt_mask = np.zeros(mask.shape, np.uint8)
-                cv2.drawContours(cnt_mask, [cnt], -1, 255, -1)
-                roi_mask = cnt_mask[y:y+h, x:x+w]
-
-                hue_pixels = roi[:, :, 0][roi_mask == 255]
-
-                if len(hue_pixels) < 50:
-                    continue
-
-                hue_std = np.std(hue_pixels)
-                if hue_std > 15:
-                    continue
-
-                self.candidates_in_image.append((cx, cy, color, orientation))
-
-                cv2.rectangle(cv_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                cv2.putText(cv_image, f"{color} {orientation}",
-                            (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            cv2.rectangle(cv_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            cv2.putText(cv_image, f"{color} {orientation}",
+                        (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
         cv2.imshow("Barrels", cv_image)
         cv2.waitKey(1)
@@ -132,6 +208,10 @@ class BarrelDetector(Node):
 
             d = points[cy, cx]
             if not np.isfinite(d).all() or np.linalg.norm(d) < 0.001:
+                continue
+
+            depth = np.linalg.norm(d)
+            if depth > 4.0:
                 continue
 
             p_cam = PointStamped()
@@ -162,7 +242,6 @@ class BarrelDetector(Node):
                 f"({p_map.point.x:.2f}, {p_map.point.y:.2f})"
             )
 
-
 def main():
     rclpy.init()
     node = BarrelDetector()
@@ -170,7 +249,6 @@ def main():
     cv2.destroyAllWindows()
     node.destroy_node()
     rclpy.shutdown()
-
 
 if __name__ == "__main__":
     main()
