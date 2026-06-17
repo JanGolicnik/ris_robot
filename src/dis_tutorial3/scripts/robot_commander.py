@@ -35,6 +35,7 @@ from dis_tutorial3_interfaces.msg import FaceDetection
 class State(Enum):
     SEARCHING = auto()
     MOVING_TO_FACE = auto()
+    CONVERSE = auto()
     SPINNING = auto()
 
 
@@ -66,6 +67,8 @@ class RobotCommander(Node):
         self.bridge = CvBridge()
         self.latest_top_image = None
 
+        self.qr = cv2.QRCodeDetector()
+
         self.create_subscription(
             PoseWithCovarianceStamped,
             "amcl_pose",
@@ -95,8 +98,11 @@ class RobotCommander(Node):
             self._barrelCallback,
             QoSProfile(depth=10, reliability=QoSReliabilityPolicy.BEST_EFFORT),
         )
-        self.create_subscription(  # top arm kamera
+        self.create_subscription(
             Image, "/top_camera/rgb/preview/image_raw", self.top_camera_callback, 10
+        )
+        self.create_subscription(
+            Image, "/oakd/rgb/preview/image_raw", self.front_camera_callback, 10
         )
         self.face_marker_pub = self.create_publisher(
             Marker, "/detected_face_marker", 10
@@ -122,6 +128,12 @@ class RobotCommander(Node):
 
         self.goal_marker_pub = self.create_publisher(Marker, "/goal_marker", 10)
 
+    def read_qr(self):
+        if self.latest_front_image is None:
+            return ""
+        data, points, _ = self.qr.detectAndDecode(self.latest_front_image)
+        return data
+
     def main_loop(self):
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.1)
@@ -129,10 +141,31 @@ class RobotCommander(Node):
                 self.update_search()
             elif self.state == State.MOVING_TO_FACE:
                 self.update_moving_to_face()
+            elif self.state == State.CONVERSE:
+                self.update_converse()
             elif self.state == State.SPINNING:
                 self.update_spinning()
             self.publish_detection_markers()
             # self.test_anomaly_detection()
+
+    def update_converse(self):
+        face = self.current_face
+        self.say(f"Hello {face['name']}, the {face['job']}.")
+        instruction = face["instruction"]
+        next_task = ""
+        if "anomalies" in instruction or "defect" in instruction or "belt":
+            if "red" in instruction:
+                next_task = "red anomalies"
+            else:
+                next_task = "green anomalies"
+        elif "rings" in instruction:
+            next_task = "rings"
+        elif "barrels":
+            next_task = "barrels"
+
+        self.say(f"Ok i will do the {next_task}")
+        self.current_face = None
+        self.state = State.SEARCHING
 
     def update_search(self):
         if not self.isTaskComplete():
@@ -159,12 +192,11 @@ class RobotCommander(Node):
             return
         face = self.current_face
         if self.getResult() == TaskResult.SUCCEEDED:
-            foid = face["pronouns"] in ("she/her")
-            self.say(
-                f"hello {face['name']}! you are a {'foid' if foid else 'chud'} {face['job']}"
-            )
-        self.state = State.SEARCHING
-        self.current_face = None
+            face["instruction"] = self.read_qr()
+            self.state = State.CONVERSE
+        else:
+            self.state = State.SEARCHING
+            self.current_face = None
 
     def update_spinning(self):
         if not self.isTaskComplete():
@@ -281,6 +313,9 @@ class RobotCommander(Node):
 
     def top_camera_callback(self, msg):
         self.latest_top_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+
+    def front_camera_callback(self, msg):
+        self.latest_front_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
 
     def getResult(self):
         if self.status == GoalStatus.STATUS_SUCCEEDED:
