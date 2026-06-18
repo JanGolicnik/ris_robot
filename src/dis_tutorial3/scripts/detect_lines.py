@@ -41,7 +41,7 @@ class LineDetector:
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         if not contours:
-            return False, None, None, None, mask
+            return False, None, None, None, mask, None, None, None
 
         largest = max(contours, key=cv2.contourArea)
 
@@ -49,7 +49,7 @@ class LineDetector:
 
         # reject tiny garbage
         if bw < 30:
-            return False, None, None, None, mask
+            return False, None, None, None, mask, None, None, None
 
         rect = cv2.minAreaRect(largest)
 
@@ -57,7 +57,7 @@ class LineDetector:
         angle = rect[2]
 
         cx = int(center[0])
-        cy = int(center[1]) + int(h * 0.75)
+        cy = int(center[1]) + int(h * 0.5)
 
         # dodatek za junction detection, samo pogleda piksle pa ce so poti levo, naravnost...
         bottom = mask[-40:, :]
@@ -75,4 +75,4 @@ class LineDetector:
 
         cv2.imshow("line mask", mask)
 
-        return (True, cx, cy, angle, mask)
+        return (True, cx, cy, angle, mask, left_exists, center_exists, right_exists)

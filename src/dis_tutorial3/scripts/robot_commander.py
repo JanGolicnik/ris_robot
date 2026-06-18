@@ -20,6 +20,7 @@ from geometry_msgs.msg import (
     PoseWithCovarianceStamped,
     Quaternion,
     Twist,
+    TwistStamped,
 )
 from kittentts import KittenTTS
 from nav2_msgs.action import NavigateToPose, Spin
@@ -115,7 +116,7 @@ class RobotCommander(Node):
         self.turning_left = False
         self.turn_start = 0
         self.blue_done = False
-        self.blue_line_start = (2.75, -0.75)
+        self.blue_line_start = (2.75, -0.35)
 
         self.bridge = CvBridge()
         self.latest_top_image = None
@@ -188,7 +189,7 @@ class RobotCommander(Node):
         )
         self.goal_marker_pub = self.create_publisher(Marker, "/goal_marker", 10)
         self.tts_pub = self.create_publisher(String, "/speak", 10)
-        self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
+        self.cmd_vel_pub = self.create_publisher(TwistStamped, "/cmd_vel", 10)
 
         self.JOB_START = {
             Task.EXPLORE: self.start_explore,
@@ -259,6 +260,7 @@ class RobotCommander(Node):
 
     # checks if it needs a new job, othewise runs the jobs update() and its done() if its finished
     def tick(self):
+        cv2.waitKey(1)
         if self.current_job is None:
             self.current_job = self.next_job()
             if self.current_job is None:
@@ -453,9 +455,7 @@ class RobotCommander(Node):
             return False
 
         img = self.latest_front_image
-        found, cx, cy, angle, mask, left, center, right, _ = (
-            self.line_detector.find_line(img, self.target_line)
-        )
+        found, cx, cy, angle, mask = self.line_detector.find_line(img, self.target_line)
 
         if not found:
             job["lost_frames"] += 1
@@ -488,14 +488,14 @@ class RobotCommander(Node):
 
     def start_follow_blue(self, job):
         x, y = self.blue_line_start
-        # self.nav2_pose(self._pose(np.array([x, y, 0.0]), 0.0))
+        self.nav2_pose(self._pose(np.array([x, y, 0.0]), math.pi * 1.5))
         job["phase"] = "goto_start"
 
     def update_follow_blue(self, job):
 
         if job["phase"] == "goto_start":
-            # if not self.isTaskComplete():
-            #     return False
+            if not self.isTaskComplete():
+                return False
 
             job["phase"] = "follow"
             return False
@@ -523,7 +523,9 @@ class RobotCommander(Node):
             if img is None:
                 return False
 
-            found, cx, cy, angle, mask = self.line_detector.find_line(img, "blue")
+            found, cx, cy, angle, mask, left, middle, right = (
+                self.line_detector.find_line(img, "blue")
+            )
 
             qr = self.read_qr()
 
@@ -540,19 +542,11 @@ class RobotCommander(Node):
                 self.spin(math.pi * 0.1)
 
                 job["phase"] = "spinning"
-                print("not found line")
                 return False
 
             err = cx - img.shape[1] / 2
 
-            tw = Twist()
-            tw.linear.x = 0.15
-            tw.angular.z = -0.003 * err
-
-            self.info(f"MOVE {tw.linear.x:.2f} z={tw.angular.z:.2f}")
-            self.cmd_vel_pub.publish(tw)
-            print("following line")
-
+            self._drive(0.15, 0.003 * err)
             return False
 
     def done_follow_blue(self, job, result):  # TODO: actually print the damn pdf
@@ -630,6 +624,14 @@ class RobotCommander(Node):
             return False
         self.result_future = self.goal_handle.get_result_async()
         return True
+
+    def _drive(self, vx, wz):
+        msg = TwistStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "base_link"
+        msg.twist.linear.x = float(vx)
+        msg.twist.angular.z = float(wz)
+        self.cmd_vel_pub.publish(msg)
 
     def isTaskComplete(self):
         if not self.result_future:
