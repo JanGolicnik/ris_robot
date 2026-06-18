@@ -64,10 +64,10 @@ class RingDetector(Node):
         self.marker_pub = self.create_publisher(Marker, "/ring_markers", 10)
         self.marker_id = 0
 
-        cv2.namedWindow("Detected contours", cv2.WINDOW_NORMAL)
+        # cv2.namedWindow("Detected contours", cv2.WINDOW_NORMAL)
         # cv2.namedWindow("thresh_gray", cv2.WINDOW_NORMAL)
-        cv2.namedWindow("thresh_sat", cv2.WINDOW_NORMAL)
-        cv2.namedWindow("thresh_depth", cv2.WINDOW_NORMAL)
+        # cv2.namedWindow("thresh_sat", cv2.WINDOW_NORMAL)
+        # cv2.namedWindow("thresh_depth", cv2.WINDOW_NORMAL)
         cv2.namedWindow("Detected rings", cv2.WINDOW_NORMAL)
 
     def pointcloud_callback(self, msg):
@@ -239,7 +239,7 @@ class RingDetector(Node):
         kernel = np.ones((5, 5), np.uint8)
         sat = cv2.morphologyEx(sat, cv2.MORPH_CLOSE, kernel)
         # sat = cv2.morphologyEx(sat, cv2.MORPH_OPEN, kernel)
-        cv2.imshow("sat", sat)
+        # cv2.imshow("sat", sat)
         thresh_sat = cv2.adaptiveThreshold(
             sat, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 5, 7
         )
@@ -270,12 +270,12 @@ class RingDetector(Node):
         # contours = gray_contours + depth_contours + sat_contours
 
         # cv2.imshow("thresh_gray", thresh_gray)
-        cv2.imshow("thresh_sat", thresh_sat)
-        cv2.imshow("thresh_depth", thresh_depth)
+        # cv2.imshow("thresh_sat", thresh_sat)
+        # cv2.imshow("thresh_depth", thresh_depth)
 
         debug = cv_image.copy()
         cv2.drawContours(debug, contours, -1, (255, 0, 0), 1)
-        cv2.imshow("Detected contours", debug)
+        # cv2.imshow("Detected contours", debug)
 
         return contours
 

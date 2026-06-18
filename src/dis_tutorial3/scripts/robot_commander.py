@@ -9,6 +9,7 @@ from enum import Enum
 import cv2
 import numpy as np
 import rclpy
+import yaml
 from action_msgs.msg import GoalStatus
 from anomaly_detector import AnomalyDetector
 from builtin_interfaces.msg import Duration
@@ -45,6 +46,7 @@ class Task(Enum):
     FIND_RINGS = 3
     FIND_BARRELS = 4
     INSPECT_BELT = 5
+    GOTO_POINT = 6
 
 
 class TaskResult(Enum):
@@ -56,6 +58,7 @@ class TaskResult(Enum):
 
 def parse_instruction(text):
     t = (text or "").lower()
+    print(f"PARSING INSTRUCTION {t}")
     is_belt = any(k in t for k in ("anomal", "defect", "belt"))
     if is_belt and "red" in t:
         return {"type": Task.INSPECT_BELT, "color": "red"}
@@ -69,7 +72,9 @@ def parse_instruction(text):
 
 
 class RobotCommander(Node):
-    MAX_GREET_ATTEMPTS = 3
+    MAX_GREET_ATTEMPTS = 2
+    FACE_STANDOFF = 0.5
+    USE_WAYPOINT_ORIENTATION = True
     BELT_SPEED = 0.15
     BELT_STEER_GAIN = 0.003
     BELT_LOST_LIMIT = 15
@@ -86,6 +91,9 @@ class RobotCommander(Node):
 
         self.patrol_waypoints = []
         self._patrol_i = 0
+
+        # remembered map position of the red / green belt line, filled during patrol
+        self.belt_positions = {}
 
         self.detected_face_candidates = []
         self.detected_faces = []
@@ -112,6 +120,17 @@ class RobotCommander(Node):
         self._wav_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "greeting.wav"
         )
+
+        # waypoints file is exported from rviz, defaults to the workspace root
+        self.declare_parameter("waypoints_file", "waypoints.yaml")
+        wp_path = (
+            self.get_parameter("waypoints_file").get_parameter_value().string_value
+        )
+        try:
+            self.patrol_waypoints = self.load_waypoints(wp_path)
+            self.info(f"loaded {len(self.patrol_waypoints)} waypoints from {wp_path}")
+        except Exception as e:
+            self.error(f"could not load waypoints from {wp_path}: {e}")
 
         self.nav_to_pose_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
         self.spin_client = ActionClient(self, Spin, "spin")
@@ -168,6 +187,7 @@ class RobotCommander(Node):
         self.JOB_START = {
             Task.EXPLORE: self.start_explore,
             Task.GOTO_FACE: self.start_goto_face,
+            Task.GOTO_POINT: self.start_goto_point,
             Task.FIND_RINGS: self.start_find_rings,
             Task.FIND_BARRELS: self.start_find_barrels,
             Task.INSPECT_BELT: self.start_inspect_belt,
@@ -176,13 +196,16 @@ class RobotCommander(Node):
         self.JOB_UPDATE = {
             Task.EXPLORE: self.done_task_complete,
             Task.GOTO_FACE: self.done_task_complete,
+            Task.GOTO_POINT: self.done_task_complete,
             Task.FIND_RINGS: self.done_task_complete,
             Task.FIND_BARRELS: self.done_task_complete,
-            Task.INSPECT_BELT: self.update_inspect_belt,
+            Task.INSPECT_BELT: self.done_task_complete,
         }
 
         self.JOB_DONE = {
+            Task.EXPLORE: self.done_explore,
             Task.GOTO_FACE: self.done_goto_face,
+            Task.GOTO_POINT: self.done_goto_point,
             Task.CONVERSE: self.done_converse,
             Task.FIND_RINGS: self.done_find_rings,
             Task.FIND_BARRELS: self.done_find_barrels,
@@ -191,10 +214,38 @@ class RobotCommander(Node):
 
         self.info("Robot commander initialized")
 
+    # read the rviz-exported waypoints; each has a pose and an optional orientation
+    def load_waypoints(self, path):
+        with open(path, "r") as f:
+            data = yaml.safe_load(f) or {}
+        raw = data.get("waypoints", {})
+        # keys are waypoint0, waypoint1, ... sort by their numeric suffix
+        keys = sorted(raw, key=lambda k: int("".join(c for c in k if c.isdigit()) or 0))
+        wps = []
+        for k in keys:
+            wp = raw[k]
+            pose = wp["pose"]
+            x, y = float(pose[0]), float(pose[1])
+            orient = wp.get("orientation")
+            yaw = None
+            if orient is not None:
+                # NOTE: the rviz export packs the yaw into orientation[0] (the z
+                # component) and keeps w last; the middle two are 0 for a ground
+                # robot. Reconstruct a clean yaw from those two. Verify the heading
+                # at waypoint0/1 once on the robot, the order is nonstandard so a
+                # wrong guess would flip the facing.
+                qz, qw = float(orient[0]), float(orient[3])
+                yaw = 2.0 * math.atan2(qz, qw)
+            wps.append({"x": x, "y": y, "yaw": yaw})
+        return wps
+
     def main_loop(self):
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.1)
             self.tick()
+            # only remember belt lines while we are still patrolling
+            if not self.exploration_done():
+                self.update_belt_memory()
             self.publish_detection_markers()
 
     # checks if it needs a new job, othewise runs the jobs update() and its done() if its finished
@@ -206,26 +257,33 @@ class RobotCommander(Node):
                     self.info("no jobs left; mission idle")
                     self._mission_done_logged = True
                 return
+            self.info(f"got a new job {self.current_job}")
             self._mission_done_logged = False
             start = self.JOB_START.get(self.current_job["type"])
             if start is not None:
+                self.info(f"start job {self.current_job}")
                 start(self.current_job)
             return
 
         job = self.current_job
         update = self.JOB_UPDATE.get(job["type"])
-        if update is not None and not update(job):
-            return
+        if update is not None:
+            # self.info(f"update job {job}")
+            if not update(job):
+                return
 
         self.current_job = None
         done = self.JOB_DONE.get(job["type"])
         if done is not None:
+            self.info(f"done job {job}")
             done(job, self.getResult())
 
-    # get the next queued job or select the next known face to visit or go explore
+    # get the next queued job, then patrol every waypoint, and only then visit known faces
     def next_job(self):
         if self.job_queue:
             return self.job_queue.pop(0)
+        if not self.exploration_done():
+            return {"type": Task.EXPLORE}
         face = next(
             (
                 f
@@ -236,33 +294,56 @@ class RobotCommander(Node):
         )
         if face is not None:
             return {"type": Task.GOTO_FACE, "face": face}
-        if not self.exploration_done():
-            return {"type": Task.EXPLORE}
         return None
 
     def exploration_done(self):
+        if len(self.patrol_waypoints) == 0:
+            return True
         return self._patrol_i >= len(self.patrol_waypoints)
 
     def enqueue(self, job):
         self.job_queue.append(job)
 
+    # run line detection while patrolling and store the first map position we see each belt
+    def update_belt_memory(self):
+        if self.latest_front_image is None or self.current_pose is None:
+            return
+        for color in ("red", "green"):
+            if color in self.belt_positions:
+                continue
+            found, *_ = self.line_detector.find_line(self.latest_front_image, color)
+            if found:
+                p = self.current_pose.pose.position
+                self.belt_positions[color] = np.array([p.x, p.y, 0.0])
+                self.info(f"remembered {color} belt at {self.belt_positions[color]}")
+
     # if a task needs to wait for nav / rotation
     def done_task_complete(self, job):
-        self.isTaskComplete()
+        return self.isTaskComplete()
 
     # set the next waypoint to visit
     def start_explore(self, job):
-        x, y = self.patrol_waypoints[self._patrol_i]
+        wp = self.patrol_waypoints[self._patrol_i]
         self._patrol_i += 1
-        self.publish_goal_marker(x, y)
-        self.nav2_pose(self._pose(np.array([x, y, 0.0]), 0.0))
+        pos = np.array([wp["x"], wp["y"], 0.0])
+        if self.USE_WAYPOINT_ORIENTATION and wp["yaw"] is not None:
+            yaw = wp["yaw"]
+        else:
+            # face the direction of travel so we don't spin in place on arrival
+            yaw = self._heading_to(pos)
+        self.publish_goal_marker(wp["x"], wp["y"])
+        self.nav2_pose(self._pose(pos, yaw))
+
+    def done_explore(self, job, result):
+        if result != TaskResult.SUCCEEDED:
+            self.warn("failed to reach patrol waypoint")
 
     # go to face position
     def start_goto_face(self, job):
         face = job["face"]
-        pos = face["pos"] + face["normal"] * 0.5
+        pos = face["pos"] + face["normal"] * self.FACE_STANDOFF
         direction = face["pos"] - pos
-        yaw = math.atan2(direction[1], direction[0])
+        yaw = math.atan2(direction[1], direction[0]) + 0.25
         self.publish_goal_marker(float(pos[0]), float(pos[1]))
         self.nav2_pose(self._pose(pos, yaw))
 
@@ -289,26 +370,73 @@ class RobotCommander(Node):
         self.say(f"OK. I will {self._task_phrase(task)}.")
         self.enqueue(task)
 
+    # navigate to a single point, optional yaw, used for rings / barrels / belt spot
+    def start_goto_point(self, job):
+        pos = job["pos"]
+        # face the direction of travel unless an explicit yaw is given
+        yaw = job["yaw"] if job.get("yaw") is not None else self._heading_to(pos)
+        self.publish_goal_marker(float(pos[0]), float(pos[1]))
+        self.nav2_pose(self._pose(pos, yaw))
+
+    def done_goto_point(self, job, result):
+        label = job.get("label", "point")
+        if result == TaskResult.SUCCEEDED:
+            self.info(f"reached {label}")
+        else:
+            self.warn(f"could not reach {label}")
+
+    # queue a visit to every ring found during the patrol
     def start_find_rings(self, job):
-        # TODO: walk around ig idk
-        return
+        for i, ring in enumerate(self.detected_rings):
+            self.enqueue(
+                {
+                    "type": Task.GOTO_POINT,
+                    "pos": ring["pos"].copy(),
+                    "yaw": None,
+                    "label": f"ring {i} ({ring['color']})",
+                }
+            )
 
     def done_find_rings(self, job, result):
-        self.say(f"I found 3 new rings. {len(self.detected_rings)} in total.")
+        self.say(f"I will visit {len(self.detected_rings)} rings.")
 
+    # queue a visit to every barrel found during the patrol
     def start_find_barrels(self, job):
-        # TODO: walk around ig idk
-        return
+        for i, barrel in enumerate(self.detected_barrels):
+            self.enqueue(
+                {
+                    "type": Task.GOTO_POINT,
+                    "pos": barrel["pos"].copy(),
+                    "yaw": None,
+                    "label": f"barrel {i} ({barrel['color']})",
+                }
+            )
 
     def done_find_barrels(self, job, result):
-        self.say(f"I found 3 new barrels. {len(self.detected_barrels)} in total.")
+        self.say(f"I will visit {len(self.detected_barrels)} barrels.")
 
+    # drive to the belt spot we remembered during the patrol, inspection itself is a todo
     def start_inspect_belt(self, job):
-        self.target_line = job["color"]
-        job["lost_frames"] = 0
-        job["anomalies"] = 0
-        job["last_anomaly_t"] = 0.0
+        color = job["color"]
+        self.target_line = color
+        spot = self.belt_positions.get(color)
+        job["reached"] = spot is not None
+        if spot is None:
+            self.warn(f"no {color} belt remembered from patrol")
+            return
+        self.publish_goal_marker(float(spot[0]), float(spot[1]))
+        self.nav2_pose(self._pose(spot, self._current_yaw()))
 
+    def done_inspect_belt(self, job, result):
+        self._stop()
+        if not job.get("reached"):
+            self.say(f"I could not find the {job['color']} belt.")
+            return
+        self.say(f"I am at the {job['color']} belt.")
+        # TODO: follow the belt and run anomaly detection, see update_inspect_belt
+
+    # TODO: belt following + anomaly inspection. Not wired into JOB_UPDATE yet;
+    # INSPECT_BELT currently just drives to the remembered spot above.
     def update_inspect_belt(self, job):
         if self.latest_front_image is None:
             return False
@@ -338,12 +466,6 @@ class RobotCommander(Node):
             self.warn(f"anomaly #{job['anomalies']} on {job['color']} belt")
 
         return False
-
-    def done_inspect_belt(self, job, result):
-        self._stop()
-        self.say(
-            f"Finished the {job['color']} belt. I found {job['anomalies']} anomalies."
-        )
 
     def _task_phrase(self, task):
         return {
@@ -461,6 +583,19 @@ class RobotCommander(Node):
         q = quaternion_from_euler(0, 0, angle_z)
         return Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
 
+    def _current_yaw(self):
+        if self.current_pose is None:
+            return 0.0
+        q = self.current_pose.pose.orientation
+        return 2.0 * math.atan2(q.z, q.w)
+
+    # heading from the robot's current position toward a target point
+    def _heading_to(self, target):
+        if self.current_pose is None:
+            return 0.0
+        p = self.current_pose.pose.position
+        return math.atan2(target[1] - p.y, target[0] - p.x)
+
     def _update_candidate(
         self,
         candidates,
@@ -520,17 +655,19 @@ class RobotCommander(Node):
         if nrm > 0:
             normal = normal / nrm
 
-        robot_pos = np.array(
-            [self.current_pose.pose.position.x, self.current_pose.pose.position.y, 0.0]
-        )
-        if np.linalg.norm(pos - robot_pos) > 2.5:
-            return
+        # robot_pos = np.array(
+        #     [self.current_pose.pose.position.x, self.current_pose.pose.position.y, 0.0]
+        # )
+        # if np.linalg.norm(pos - robot_pos) > 2.5:
+        #     print("face too far")
+        #     return
 
         for f in self.detected_faces:
             if np.linalg.norm(pos - f["pos"]) < 0.5:
                 f["name"] = msg.name
                 f["job"] = msg.job
                 f["pronouns"] = msg.pronouns
+                print("face already in")
                 return
 
         rec = self._update_candidate(
@@ -548,6 +685,8 @@ class RobotCommander(Node):
             rec["greeted"] = False
             rec["attempts"] = 0
             self.info(f"CONFIRMED face at {rec['pos']}")
+        else:
+            print("face not detected enough")
 
     def _ringCallback(self, msg):
         pos = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
