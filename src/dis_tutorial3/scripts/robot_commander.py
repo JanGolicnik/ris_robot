@@ -24,6 +24,7 @@ from geometry_msgs.msg import (
     PoseWithCovarianceStamped,
     Quaternion,
     Twist,
+    TwistStamped,
 )
 from kittentts import KittenTTS
 from nav2_msgs.action import NavigateToPose, Spin
@@ -105,10 +106,13 @@ class RobotCommander(Node):
     BELT_MAX_POINTS = 4000  # cap stored points per color
     BELT_POINT_STRIDE = 20  # subsample stride over the line mask pixels each frame
 
-    BELT_FORWARD_SPEED = 0.15  # m/s while following the line
+    BELT_FORWARD_SPEED = 0.75  # m/s while following the line
     BELT_TURN_SPEED = 0.5  # rad/s for the 90 deg turn (negative = right/CW)
-    BELT_STRAIGHT_SECS = (
-        4.0  # how long to drive straight after the turn (your "amount")
+    BELT_STRAIGHT_SECS_RED = (
+        10.0  # how long to drive straight after the turn (your "amount")
+    )
+    BELT_STRAIGHT_SECS_GREEN = (
+        15.0  # how long to drive straight after the turn (your "amount")
     )
     BELT_COLOR_LOST_FRAMES = 10
 
@@ -234,7 +238,7 @@ class RobotCommander(Node):
         )
         self.goal_marker_pub = self.create_publisher(Marker, "/goal_marker", 10)
         self.tts_pub = self.create_publisher(String, "/speak", 10)
-        self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
+        self.cmd_vel_pub = self.create_publisher(TwistStamped, "/cmd_vel", 10)
 
         self.JOB_START = {
             Task.EXPLORE: self.start_explore,
@@ -349,7 +353,7 @@ class RobotCommander(Node):
         )
         if face is not None:
             return {"type": Task.GOTO_FACE, "face": face}
-        return {"type": Task.INSPECT_BELT, "color": "red"}
+        return {"type": Task.INSPECT_BELT, "color": "green"}
         # if not getattr(self, "blue_done", False):
         #     return {"type": Task.FOLLOW_BLUE}
         return None
@@ -402,13 +406,15 @@ class RobotCommander(Node):
         if color == "red":
             start = np.array([0.35, -4.29])
             end = np.array([0.415, -4.29])
+            yaw = math.pi * 1.55
         elif color == "green":
-            start = np.array([-4.62, -2.75])
+            start = np.array([-4.22, -2.72])
             end = np.array([-4.65, 0.23])
+            yaw = math.pi
         else:
             return None
 
-        yaw = math.atan2(end[1] - start[1], end[0] - start[0])
+        # yaw = math.atan2(end[1] - start[1], end[0] - start[0])
         return start, end, yaw
         # pts = np.array(self.belt_points.get(color, []), dtype=float)
         # if len(pts) < self.BELT_MIN_POINTS:
@@ -575,12 +581,11 @@ class RobotCommander(Node):
             if not self.isTaskComplete():
                 return False
             job["lost"] = 0
+            job["final_turn"] = False
             job["phase"] = "forward"
             return False
 
         if job["phase"] == "forward":
-            # self._belt_check_anomaly(job)
-            # see the line color?
             seen = False
             if self.latest_front_image is not None:
                 found, *_ = self.line_detector.find_line(
@@ -600,22 +605,44 @@ class RobotCommander(Node):
             return False
 
         if job["phase"] == "turn":
-            # rotate right (clockwise) until ~90 deg from where we started turning
             turned = abs(self._angle_diff(self._current_yaw(), job["turn_start_yaw"]))
-            if turned >= math.pi / 2:
+            if turned >= math.pi * 0.55:
                 self._stop()
                 job["phase"] = "straight"
                 job["straight_start"] = time.time()
                 return False
-            self._drive(0.0, -self.BELT_TURN_SPEED)  # negative wz = clockwise = right
+            self._drive(0.0, -self.BELT_TURN_SPEED)
             return False
 
         if job["phase"] == "straight":
-            self._belt_check_anomaly(job)
-            if time.time() - job["straight_start"] >= self.BELT_STRAIGHT_SECS:
+            move_time = 1.0
+            turn_rate = 0.0
+
+            if not job["final_turn"]:
+                self._belt_check_anomaly(job)
+                move_time = (
+                    self.BELT_STRAIGHT_SECS_GREEN
+                    if job["color"] == "green"
+                    else self.BELT_STRAIGHT_SECS_RED
+                )
+                if self.latest_front_image is not None:
+                    found, *_ = self.line_detector.find_line(
+                        self.latest_front_image, job["color"]
+                    )
+                    if found:
+                        turn_rate = self.BELT_TURN_SPEED * 0.2
+
+            if time.time() - job["straight_start"] >= move_time:
                 self._stop()
-                return True
-            self._drive(self.BELT_FORWARD_SPEED, 0.0)
+                if job["final_turn"]:
+                    return True
+                else:
+                    job["phase"] = "turn"
+                    job["turn_start_yaw"] = self._current_yaw()
+                    job["final_turn"] = True
+                return False
+
+            self._drive(self.BELT_FORWARD_SPEED, turn_rate)
             return False
 
         return True
@@ -644,19 +671,13 @@ class RobotCommander(Node):
         x, y = self.blue_line_start
         job.setdefault("seen_qrs", set())
 
-        self.nav2_pose(
-            self._pose(
-                np.array([x, y, 0.0]),
-                math.pi * 1.5
-            )
-        )
+        self.nav2_pose(self._pose(np.array([x, y, 0.0]), math.pi * 1.5))
 
         job["phase"] = "goto_start"
         job["lost_frames"] = 0
 
     def update_follow_blue(self, job):
         if job["phase"] == "goto_start":
-
             if not self.isTaskComplete():
                 return False
 
@@ -665,7 +686,6 @@ class RobotCommander(Node):
             return False
 
         if job["phase"] == "spinning":
-
             if not self.isTaskComplete():
                 return False
 
@@ -676,22 +696,12 @@ class RobotCommander(Node):
         if job["phase"] != "follow":
             return False
 
-        cto = next(
-            (
-                f for f in self.detected_faces
-                if "cto" in f["job"].lower()
-            ),
-            None
-        )
+        cto = next((f for f in self.detected_faces if "cto" in f["job"].lower()), None)
 
         if cto is not None:
-
             self._stop()
 
-            self.enqueue({
-                "type": Task.GOTO_FACE,
-                "face": cto
-            })
+            self.enqueue({"type": Task.GOTO_FACE, "face": cto})
 
             self.info("CTO found")
             return True
@@ -701,8 +711,8 @@ class RobotCommander(Node):
         if img is None:
             return False
 
-        found, cx, cy, angle, mask, left, middle, right = (
-            self.line_detector.find_line(img, "blue")
+        found, cx, cy, angle, mask, left, middle, right = self.line_detector.find_line(
+            img, "blue"
         )
 
         blue_pixels = 0 if mask is None else cv2.countNonZero(mask)
@@ -710,32 +720,22 @@ class RobotCommander(Node):
         print(f"blue pixels: {blue_pixels}")
 
         if found and blue_pixels < 1200:
-
             self._stop()
             time.sleep(0.5)
 
             qr = self.read_qr()
 
             if qr and qr not in job["seen_qrs"]:
-
                 job["seen_qrs"].add(qr)
 
                 self.say(qr)
 
             cto = next(
-                (
-                    f for f in self.detected_faces
-                    if "cto" in f["job"].lower()
-                ),
-                None
+                (f for f in self.detected_faces if "cto" in f["job"].lower()), None
             )
 
             if cto is not None:
-
-                self.enqueue({
-                    "type": Task.GOTO_FACE,
-                    "face": cto
-                })
+                self.enqueue({"type": Task.GOTO_FACE, "face": cto})
 
                 self.info("CTO found")
                 return True
@@ -748,7 +748,6 @@ class RobotCommander(Node):
             return False
 
         if not found:
-
             job["lost_frames"] += 1
 
             if job["lost_frames"] < 40:
@@ -765,7 +764,6 @@ class RobotCommander(Node):
         junction = path_count >= 2
 
         if junction:
-
             if right:
                 target_x = width * 0.75
             elif middle:
@@ -792,6 +790,14 @@ class RobotCommander(Node):
             f"I found the CTO. I detected {len(self.detected_rings)} rings and {len(self.detected_barrels)} barrels."
         )
 
+    def _drive(self, vx, wz):
+        msg = TwistStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "base_link"
+        msg.twist.linear.x = float(vx)
+        msg.twist.angular.z = float(wz)
+        self.cmd_vel_pub.publish(msg)
+
     def _task_phrase(self, task):
         return {
             Task.FIND_RINGS: "search for all the rings",
@@ -812,7 +818,7 @@ class RobotCommander(Node):
         h_full = img.shape[0]
         w_full = img.shape[1]
         img = img[
-            int(h_full * 0.15) : int(h_full * 0.65),
+            int(h_full * 0.25) : int(h_full * 0.8),
             int(w_full * 0.2) : int(w_full * 0.8),
         ]
         cv2.imshow("img", img)
