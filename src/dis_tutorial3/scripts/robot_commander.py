@@ -9,6 +9,8 @@ from enum import Enum
 import cv2
 import numpy as np
 import rclpy
+import sensor_msgs_py.point_cloud2 as pc2
+import tf2_geometry_msgs  # noqa: F401  registers the PointStamped transform
 import yaml
 from action_msgs.msg import GoalStatus
 from anomaly_detector import AnomalyDetector
@@ -16,15 +18,17 @@ from builtin_interfaces.msg import Duration
 from cv_bridge import CvBridge
 from detect_lines import LineDetector
 from geometry_msgs.msg import (
+    Point,
+    PointStamped,  # add to your geometry_msgs import
     PoseStamped,
     PoseWithCovarianceStamped,
     Quaternion,
     Twist,
-    TwistStamped,
 )
 from kittentts import KittenTTS
 from nav2_msgs.action import NavigateToPose, Spin
 from rclpy.action import ActionClient
+from rclpy.duration import Duration as RDuration
 from rclpy.node import Node
 from rclpy.qos import (
     QoSDurabilityPolicy,
@@ -32,8 +36,15 @@ from rclpy.qos import (
     QoSProfile,
     QoSReliabilityPolicy,
 )
-from sensor_msgs.msg import Image
+from rclpy.time import Time
+from sensor_msgs.msg import (
+    CameraInfo,
+    Image,
+    PointCloud2,  # add to your sensor_msgs import
+)
 from std_msgs.msg import String
+from tf2_ros.buffer import Buffer
+from tf2_ros.transform_listener import TransformListener
 from turtle_tf2_py.turtle_tf2_broadcaster import quaternion_from_euler
 from visualization_msgs.msg import Marker
 
@@ -82,6 +93,25 @@ class RobotCommander(Node):
     BELT_LOST_LIMIT = 15
     ANOMALY_COOLDOWN = 1.0
 
+    BELT_LANE_OFFSET = (
+        0.0  # m, lateral offset from the line to the driving lane (0 = on the line)
+    )
+    BELT_SIDE = 1  # +1 / -1, which side of the line the lane sits on (only matters if offset != 0)
+    BELT_MAX_RANGE = (
+        3.0  # m, drop projected points further than this (shallow rays are noisy)
+    )
+    BELT_MIN_POINTS = 30  # need at least this many accumulated points to trust a fit
+    BELT_MIN_LENGTH = 0.3  # m, reject a fit shorter than this
+    BELT_MAX_POINTS = 4000  # cap stored points per color
+    BELT_POINT_STRIDE = 20  # subsample stride over the line mask pixels each frame
+
+    BELT_FORWARD_SPEED = 0.15  # m/s while following the line
+    BELT_TURN_SPEED = 0.5  # rad/s for the 90 deg turn (negative = right/CW)
+    BELT_STRAIGHT_SECS = (
+        4.0  # how long to drive straight after the turn (your "amount")
+    )
+    BELT_COLOR_LOST_FRAMES = 10
+
     def __init__(self):
         super().__init__("robot_commander")
 
@@ -94,8 +124,13 @@ class RobotCommander(Node):
         self.patrol_waypoints = []
         self._patrol_i = 0
 
-        # remembered map position of the red / green belt line, filled during patrol
-        self.belt_positions = {}
+        # line points projected into the map during patrol, fit to a line on demand
+        self.belt_points = {"red": [], "green": []}
+        self.front_K = None  # (fx, fy, cx, cy) from camera_info
+        self.front_header = None  # stamp + optical frame of the latest front image
+
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=True)
 
         self.detected_face_candidates = []
         self.detected_faces = []
@@ -142,6 +177,9 @@ class RobotCommander(Node):
         self.nav_to_pose_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
         self.spin_client = ActionClient(self, Spin, "spin")
 
+        self.latest_front_cloud = None  # organized (h, w, 3) in the camera frame
+        self.front_cloud_header = None
+
         self.create_subscription(
             PoseWithCovarianceStamped,
             "amcl_pose",
@@ -177,19 +215,26 @@ class RobotCommander(Node):
         self.create_subscription(
             Image, "/oakd/rgb/preview/image_raw", self._frontCameraCallback, 10
         )
+        self.create_subscription(
+            PointCloud2, "/oakd/rgb/preview/depth/points", self._frontCloudCallback, 10
+        )
 
         self.face_marker_pub = self.create_publisher(
             Marker, "/detected_face_marker", 10
         )
+        self.arm_mover_pub = self.create_publisher(String, "/arm_command", 10)
         self.ring_marker_pub = self.create_publisher(
             Marker, "/detected_ring_marker", 10
         )
         self.barrel_marker_pub = self.create_publisher(
             Marker, "/detected_barrel_marker", 10
         )
+        self.belt_points_pub = self.create_publisher(
+            Marker, "/detected_belts_marker", 10
+        )
         self.goal_marker_pub = self.create_publisher(Marker, "/goal_marker", 10)
         self.tts_pub = self.create_publisher(String, "/speak", 10)
-        self.cmd_vel_pub = self.create_publisher(TwistStamped, "/cmd_vel", 10)
+        self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
 
         self.JOB_START = {
             Task.EXPLORE: self.start_explore,
@@ -253,9 +298,8 @@ class RobotCommander(Node):
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.1)
             self.tick()
-            # only remember belt lines while we are still patrolling
-            if not self.exploration_done():
-                self.update_belt_memory()
+            # only accumulate belt-line points while we are still patrolling
+            # self._accumulate_belt_points()
             self.publish_detection_markers()
 
     # checks if it needs a new job, othewise runs the jobs update() and its done() if its finished
@@ -305,8 +349,9 @@ class RobotCommander(Node):
         )
         if face is not None:
             return {"type": Task.GOTO_FACE, "face": face}
-        if not getattr(self, "blue_done", False):
-            return {"type": Task.FOLLOW_BLUE}
+        return {"type": Task.INSPECT_BELT, "color": "red"}
+        # if not getattr(self, "blue_done", False):
+        #     return {"type": Task.FOLLOW_BLUE}
         return None
 
     def exploration_done(self):
@@ -317,18 +362,88 @@ class RobotCommander(Node):
     def enqueue(self, job):
         self.job_queue.append(job)
 
-    # run line detection while patrolling and store the first map position we see each belt
-    def update_belt_memory(self):
-        if self.latest_front_image is None or self.current_pose is None:
-            return
-        for color in ("red", "green"):
-            if color in self.belt_positions:
-                continue
-            found, *_ = self.line_detector.find_line(self.latest_front_image, color)
-            if found:
-                p = self.current_pose.pose.position
-                self.belt_positions[color] = np.array([p.x, p.y, 0.0])
-                self.info(f"remembered {color} belt at {self.belt_positions[color]}")
+    # def _accumulate_belt_points(self):
+    #     if self.latest_front_image is None or self.latest_front_cloud is None:
+    #         return
+    #     img = self.latest_front_image
+    #     cloud = self.latest_front_cloud
+    #     h, w = cloud.shape[:2]
+    #     frame = self.front_cloud_header.frame_id
+    #     v_off = int(img.shape[0] * 0.5)  # find_line uses the bottom half as ROI
+
+    #     for color in ("red", "green"):
+    #         found, _, _, _, mask, _, _, _ = self.line_detector.find_line(img, color)
+    #         if not found or mask is None:
+    #             continue
+    #         ys, xs = np.nonzero(mask)
+    #         if xs.size == 0:
+    #             continue
+    #         for i in range(0, xs.size, self.BELT_POINT_STRIDE):
+    #             u = int(xs[i])
+    #             v = int(ys[i]) + v_off
+    #             if not (0 <= v < h and 0 <= u < w):
+    #                 continue
+    #             d = cloud[v, u, :]
+    #             if not np.isfinite(d).all() or np.linalg.norm(d) < 0.001:
+    #                 continue
+    #             if np.linalg.norm(d) > self.BELT_MAX_RANGE:
+    #                 continue
+    #             pm = self._to_map(d, frame, self.front_cloud_header.stamp)
+    #             if pm is None:
+    #                 continue
+    #             self.belt_points[color].append((pm.point.x, pm.point.y))
+    #         if len(self.belt_points[color]) > self.BELT_MAX_POINTS:
+    #             self.belt_points[color] = self.belt_points[color][
+    #                 -self.BELT_MAX_POINTS :
+    #             ]
+
+    # fit a straight line to the accumulated points; returns (lane_start, lane_end, yaw) or None
+    def _fit_belt(self, color):
+        if color == "red":
+            start = np.array([0.35, -4.29])
+            end = np.array([0.415, -4.29])
+        elif color == "green":
+            start = np.array([-4.62, -2.75])
+            end = np.array([-4.65, 0.23])
+        else:
+            return None
+
+        yaw = math.atan2(end[1] - start[1], end[0] - start[0])
+        return start, end, yaw
+        # pts = np.array(self.belt_points.get(color, []), dtype=float)
+        # if len(pts) < self.BELT_MIN_POINTS:
+        #     self.warn(f"only {len(pts)} {color} points, need {self.BELT_MIN_POINTS}")
+        #     return None
+
+        # c = pts.mean(axis=0)
+        # _, _, vt = np.linalg.svd(pts - c, full_matrices=False)
+        # d = vt[0]
+        # d = d / np.linalg.norm(d)
+
+        # proj = (pts - c) @ d
+        # s0, s1 = float(proj.min()), float(proj.max())
+        # if (s1 - s0) < self.BELT_MIN_LENGTH:
+        #     self.warn(f"{color} line fit too short ({s1 - s0:.2f} m)")
+        #     return None
+
+        # start = c + d * s0
+        # end = c + d * s1
+
+        # # drive from whichever end is closer to the robot
+        # if self.current_pose is not None:
+        #     rp = np.array(
+        #         [self.current_pose.pose.position.x, self.current_pose.pose.position.y]
+        #     )
+        #     if np.linalg.norm(rp - end) < np.linalg.norm(rp - start):
+        #         start, end = end, start
+        #         d = -d
+
+        # perp = np.array([-d[1], d[0]])
+        # off = perp * self.BELT_SIDE * self.BELT_LANE_OFFSET
+        # lane_start = start + off
+        # lane_end = end + off
+        # yaw = math.atan2(d[1], d[0])
+        # return lane_start, lane_end, yaw
 
     # if a task needs to wait for nav / rotation
     def update_task_complete(self, job):
@@ -428,60 +543,99 @@ class RobotCommander(Node):
     def done_find_barrels(self, job, result):
         self.say(f"I will visit {len(self.detected_barrels)} barrels.")
 
-    # drive to the belt spot we remembered during the patrol, inspection itself is a todo
+    # fit the belt line from the patrol points, drive to its near end, then along it
     def start_inspect_belt(self, job):
+        s = String()
+        s.data = "look_at_belt_left"
+        self.arm_mover_pub.publish(s)
+        # print(self._belt_anomaly())
+        # return
         color = job["color"]
         self.target_line = color
-        spot = self.belt_positions.get(color)
-        job["reached"] = spot is not None
-        if spot is None:
-            self.warn(f"no {color} belt remembered from patrol")
+        fit = self._fit_belt(color)
+        job["fitted"] = fit is not None
+        job["anomalies"] = 0
+        job["last_anomaly_t"] = 0.0
+        if fit is None:
+            self.warn(f"could not fit a {color} belt line")
             return
-        self.publish_goal_marker(float(spot[0]), float(spot[1]))
-        self.nav2_pose(self._pose(spot, self._current_yaw()))
+        lane_start, lane_end, yaw = fit
+        job["lane_end"] = np.array([lane_end[0], lane_end[1], 0.0])
+        job["yaw"] = yaw
+        job["phase"] = "goto_start"
 
-    def done_inspect_belt(self, job, result):
-        self._stop()
-        if not job.get("reached"):
-            self.say(f"I could not find the {job['color']} belt.")
-            return
-        self.say(f"I am at the {job['color']} belt.")
-        # TODO: follow the belt and run anomaly detection, see update_inspect_belt
+        self.publish_goal_marker(float(lane_start[0]), float(lane_start[1]))
+        self.nav2_pose(self._pose(np.array([lane_start[0], lane_start[1], 0.0]), yaw))
 
-    # TODO: belt following + anomaly inspection. Not wired into JOB_UPDATE yet;
-    # INSPECT_BELT currently just drives to the remembered spot above.
     def update_inspect_belt(self, job):
-        if self.latest_front_image is None:
+        if not job.get("fitted", False):
+            return True
+
+        if job["phase"] == "goto_start":
+            if not self.isTaskComplete():
+                return False
+            job["lost"] = 0
+            job["phase"] = "forward"
             return False
 
-        img = self.latest_front_image
-        found, cx, cy, angle, mask = self.line_detector.find_line(img, self.target_line)
+        if job["phase"] == "forward":
+            # self._belt_check_anomaly(job)
+            # see the line color?
+            seen = False
+            if self.latest_front_image is not None:
+                found, *_ = self.line_detector.find_line(
+                    self.latest_front_image, job["color"]
+                )
+                seen = found
+            if seen:
+                job["lost"] = 0
+            else:
+                job["lost"] += 1
+            if job["lost"] >= self.BELT_COLOR_LOST_FRAMES:
+                self._stop()
+                job["phase"] = "turn"
+                job["turn_start_yaw"] = self._current_yaw()
+                return False
+            self._drive(self.BELT_FORWARD_SPEED, 0.0)
+            return False
 
-        if not found:
-            job["lost_frames"] += 1
-            if job["lost_frames"] >= self.BELT_LOST_LIMIT:
+        if job["phase"] == "turn":
+            # rotate right (clockwise) until ~90 deg from where we started turning
+            turned = abs(self._angle_diff(self._current_yaw(), job["turn_start_yaw"]))
+            if turned >= math.pi / 2:
+                self._stop()
+                job["phase"] = "straight"
+                job["straight_start"] = time.time()
+                return False
+            self._drive(0.0, -self.BELT_TURN_SPEED)  # negative wz = clockwise = right
+            return False
+
+        if job["phase"] == "straight":
+            self._belt_check_anomaly(job)
+            if time.time() - job["straight_start"] >= self.BELT_STRAIGHT_SECS:
                 self._stop()
                 return True
+            self._drive(self.BELT_FORWARD_SPEED, 0.0)
             return False
 
-        job["lost_frames"] = 0
+        return True
 
-        err = cx - img.shape[1] / 2.0
-        tw = Twist()
-        tw.linear.x = self.BELT_SPEED
-        tw.angular.z = -self.BELT_STEER_GAIN * err
-        self.cmd_vel_pub.publish(tw)
-
+    def _belt_check_anomaly(self, job):
         now = time.time()
         if now - job["last_anomaly_t"] > self.ANOMALY_COOLDOWN and self._belt_anomaly():
             job["anomalies"] += 1
             job["last_anomaly_t"] = now
             self.warn(f"anomaly #{job['anomalies']} on {job['color']} belt")
 
-        return False
+    def _angle_diff(self, a, b):
+        d = a - b
+        return math.atan2(math.sin(d), math.cos(d))
 
     def done_inspect_belt(self, job, result):
         self._stop()
+        if not job.get("fitted", False):
+            self.say(f"I could not find the {job['color']} belt.")
+            return
         self.say(
             f"Finished the {job['color']} belt. I found {job['anomalies']} anomalies."
         )
@@ -501,7 +655,6 @@ class RobotCommander(Node):
         job["lost_frames"] = 0
 
     def update_follow_blue(self, job):
-
         if job["phase"] == "goto_start":
 
             if not self.isTaskComplete():
@@ -656,6 +809,14 @@ class RobotCommander(Node):
         if self.latest_top_image is None:
             return False
         img = self.latest_top_image
+        h_full = img.shape[0]
+        w_full = img.shape[1]
+        img = img[
+            int(h_full * 0.15) : int(h_full * 0.65),
+            int(w_full * 0.2) : int(w_full * 0.8),
+        ]
+        cv2.imshow("img", img)
+
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         _, thresh = cv2.threshold(gray, 140, 255, cv2.THRESH_BINARY)
         contours, _ = cv2.findContours(
@@ -663,17 +824,16 @@ class RobotCommander(Node):
         )
         if not contours:
             return False
-
         x, y, w, h = cv2.boundingRect(max(contours, key=cv2.contourArea))
         cx, cy = x + w // 2, y + h // 2
         size = int(min(w, h) * 0.8)
         if size < 2:
             return False
-
         tile = img[cy - size // 2 : cy + size // 2, cx - size // 2 : cx + size // 2]
         if tile.size == 0:
             return False
         tile = cv2.resize(tile, (512, 512))
+        cv2.imshow("tile", tile)
         is_anomaly, _, _ = self.anomaly_detector.detect(tile)
         return bool(is_anomaly)
 
@@ -707,14 +867,6 @@ class RobotCommander(Node):
             return False
         self.result_future = self.goal_handle.get_result_async()
         return True
-
-    def _drive(self, vx, wz):
-        msg = TwistStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = "base_link"
-        msg.twist.linear.x = float(vx)
-        msg.twist.angular.z = float(wz)
-        self.cmd_vel_pub.publish(msg)
 
     def isTaskComplete(self):
         if not self.result_future:
@@ -899,6 +1051,7 @@ class RobotCommander(Node):
 
     def _frontCameraCallback(self, msg):
         self.latest_front_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+        self.front_header = msg.header
 
     def publish_goal_marker(self, x, y):
         m = Marker()
@@ -960,6 +1113,39 @@ class RobotCommander(Node):
             m.pose.position.y = float(barrel["pos"][1])
             m.pose.position.z = 0.3
             self.barrel_marker_pub.publish(m)
+
+        for j, color in enumerate(("red", "green")):
+            m = Marker()
+            m.header.frame_id = "map"
+            m.header.stamp = self.get_clock().now().to_msg()
+            m.ns = "belt_points"
+            m.id = j
+            m.type = Marker.POINTS
+            m.action = Marker.ADD
+            m.scale.x = 0.03  # point size in metres
+            m.scale.y = 0.03
+            m.color.r, m.color.g, m.color.b = self._color_to_rgb(color)
+            m.color.a = 1.0
+            m.points = [
+                Point(x=float(x), y=float(y), z=0.0) for x, y in self.belt_points[color]
+            ]
+            self.belt_points_pub.publish(m)
+
+    def _frontCloudCallback(self, msg):
+        cloud = pc2.read_points_numpy(msg, field_names=("x", "y", "z"))
+        self.latest_front_cloud = cloud.reshape((msg.height, msg.width, 3))
+        self.front_cloud_header = msg.header
+
+    def _to_map(self, xyz, frame, stamp):
+        ps = PointStamped()
+        ps.header.frame_id = frame
+        ps.header.stamp = Time().to_msg()
+        ps.point.x, ps.point.y, ps.point.z = float(xyz[0]), float(xyz[1]), float(xyz[2])
+        try:
+            return self.tf_buffer.transform(ps, "map", timeout=RDuration(seconds=0.1))
+        except Exception as e:
+            self.warn(f"TF to map failed: {e}")
+            return None
 
     def _color_to_rgb(self, name):
         return {

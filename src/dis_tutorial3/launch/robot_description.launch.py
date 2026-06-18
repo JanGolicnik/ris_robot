@@ -16,55 +16,80 @@
 
 
 from ament_index_python.packages import get_package_share_directory
-
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import Command, PathJoinSubstitution
 from launch.substitutions.launch_configuration import LaunchConfiguration
-
 from launch_ros.actions import Node
 
-
 ARGUMENTS = [
-    DeclareLaunchArgument('model', default_value='standard',choices=['standard', 'lite'],description='Turtlebot4 Model'),
-    DeclareLaunchArgument('use_sim_time', default_value='false',choices=['true', 'false'],description='use_sim_time'),
-    DeclareLaunchArgument('robot_name', default_value='turtlebot4',description='Robot name'),
-    DeclareLaunchArgument('namespace', default_value=LaunchConfiguration('robot_name'),description='Robot namespace'),
+    DeclareLaunchArgument(
+        "model",
+        default_value="standard",
+        choices=["standard", "lite"],
+        description="Turtlebot4 Model",
+    ),
+    DeclareLaunchArgument(
+        "use_sim_time",
+        default_value="true",
+        choices=["true", "false"],
+        description="use_sim_time",
+    ),
+    DeclareLaunchArgument(
+        "robot_name", default_value="turtlebot4", description="Robot name"
+    ),
+    DeclareLaunchArgument(
+        "namespace",
+        default_value=LaunchConfiguration("robot_name"),
+        description="Robot namespace",
+    ),
 ]
 
+
 def generate_launch_description():
-    pkg_dis_tutorial3 = get_package_share_directory('dis_tutorial3')
-    xacro_file = PathJoinSubstitution([pkg_dis_tutorial3,'urdf',LaunchConfiguration('model'),'turtlebot4.urdf.xacro'])
-    namespace = LaunchConfiguration('namespace')
+    pkg_dis_tutorial3 = get_package_share_directory("dis_tutorial3")
+    xacro_file = PathJoinSubstitution(
+        [
+            pkg_dis_tutorial3,
+            "urdf",
+            LaunchConfiguration("model"),
+            "turtlebot4.urdf.xacro",
+        ]
+    )
+    namespace = LaunchConfiguration("namespace")
 
     robot_state_publisher = Node(
-        package='robot_state_publisher',
-        executable='robot_state_publisher',
-        name='robot_state_publisher',
-        output='screen',
+        package="robot_state_publisher",
+        executable="robot_state_publisher",
+        name="robot_state_publisher",
+        output="screen",
         parameters=[
-            {'use_sim_time': LaunchConfiguration('use_sim_time')},
-            {'robot_description': Command([
-                'xacro', ' ', xacro_file, ' ',
-                'gazebo:=ignition', ' ',
-                'namespace:=', namespace])},
+            {"use_sim_time": LaunchConfiguration("use_sim_time")},
+            {
+                "robot_description": Command(
+                    [
+                        "xacro",
+                        " ",
+                        xacro_file,
+                        " ",
+                        "gazebo:=ignition",
+                        " ",
+                        "namespace:=",
+                        namespace,
+                    ]
+                )
+            },
         ],
-        remappings=[
-            ('/tf', 'tf'),
-            ('/tf_static', 'tf_static')
-        ]
+        remappings=[("/tf", "tf"), ("/tf_static", "tf_static")],
     )
 
     joint_state_publisher = Node(
-        package='joint_state_publisher',
-        executable='joint_state_publisher',
-        name='joint_state_publisher',
-        output='screen',
-        parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}],
-        remappings=[
-            ('/tf', 'tf'),
-            ('/tf_static', 'tf_static')
-        ]
+        package="joint_state_publisher",
+        executable="joint_state_publisher",
+        name="joint_state_publisher",
+        output="screen",
+        parameters=[{"use_sim_time": LaunchConfiguration("use_sim_time")}],
+        remappings=[("/tf", "tf"), ("/tf_static", "tf_static")],
     )
 
     ld = LaunchDescription(ARGUMENTS)
