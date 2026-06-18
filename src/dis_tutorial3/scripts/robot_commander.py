@@ -50,6 +50,8 @@ from turtle_tf2_py.turtle_tf2_broadcaster import quaternion_from_euler
 from visualization_msgs.msg import Marker
 
 from dis_tutorial3_interfaces.msg import FaceDetection
+from sensor_msgs.msg import LaserScan
+from std_msgs.msg import String
 
 
 class Task(Enum):
@@ -151,11 +153,13 @@ class RobotCommander(Node):
         self.anomaly_detector = AnomalyDetector()
         self.line_detector = LineDetector()
         self.target_line = "blue"
+        self.last_blue_area = 0
 
         self.turning_left = False
         self.turn_start = 0
         self.blue_done = False
         self.blue_line_start = (2.75, -0.35)
+        self.line_error = 0.0
 
         self.bridge = CvBridge()
         self.latest_top_image = None
@@ -183,6 +187,15 @@ class RobotCommander(Node):
 
         self.latest_front_cloud = None  # organized (h, w, 3) in the camera frame
         self.front_cloud_header = None
+
+        self.latest_scan = None
+
+        self.create_subscription(
+            LaserScan,
+            "/scan",
+            self._scan_callback,
+            10
+        )
 
         self.create_subscription(
             PoseWithCovarianceStamped,
@@ -236,6 +249,11 @@ class RobotCommander(Node):
         self.belt_points_pub = self.create_publisher(
             Marker, "/detected_belts_marker", 10
         )
+        self.arm_pub = self.create_publisher(
+            String,
+            "/arm_command",
+            10
+        )
         self.goal_marker_pub = self.create_publisher(Marker, "/goal_marker", 10)
         self.tts_pub = self.create_publisher(String, "/speak", 10)
         self.cmd_vel_pub = self.create_publisher(TwistStamped, "/cmd_vel", 10)
@@ -273,6 +291,33 @@ class RobotCommander(Node):
 
         self.info("Robot commander initialized")
 
+    def set_arm(self, command):
+        msg = String()
+        msg.data = command
+        self.arm_pub.publish(msg)
+
+    def _scan_callback(self, msg):
+        self.latest_scan = msg
+
+    def obstacle_ahead(self, distance=0.40):
+
+        if self.latest_scan is None:
+            return False
+
+        ranges = np.array(self.latest_scan.ranges)
+
+        ranges = ranges[np.isfinite(ranges)]
+
+        if len(ranges) == 0:
+            return False
+
+        center = len(ranges) // 2
+
+        front = ranges[center - 20:center + 20]
+
+        return np.min(front) < distance
+
+    # read the rviz-exported waypoints; each has a pose and an optional orientation
     def load_waypoints(self, path):
         with open(path, "r") as f:
             data = yaml.safe_load(f) or {}
@@ -679,6 +724,8 @@ class RobotCommander(Node):
         )
 
     def start_follow_blue(self, job):
+        self.set_arm("manual:[0.,0.7,0.9,1.0]")
+
         x, y = self.blue_line_start
         job.setdefault("seen_qrs", set())
 
@@ -707,7 +754,13 @@ class RobotCommander(Node):
         if job["phase"] != "follow":
             return False
 
-        cto = next((f for f in self.detected_faces if "cto" in f["job"].lower()), None)
+        cto = next(
+            (
+                f for f in self.detected_faces
+                if "cto" in f["job"].lower()
+            ),
+            None
+        )
 
         if cto is not None:
             self._stop()
@@ -717,14 +770,30 @@ class RobotCommander(Node):
             self.info("CTO found")
             return True
 
-        img = self.latest_front_image
+        img = self.latest_top_image
 
         if img is None:
             return False
 
-        found, cx, cy, angle, mask, left, middle, right = self.line_detector.find_line(
-            img, "blue"
+        found, cx, cy, angle, mask, left, middle, right, area = (
+            self.line_detector.find_line(img, "blue")
         )
+
+        # if (
+        #     self.last_blue_area > 3000 and
+        #     area < self.last_blue_area * 0.4
+        # ):
+        #     self._stop()
+
+        #     self.spin(-math.pi / 2)
+
+        #     job["phase"] = "spinning"
+
+        #     self.last_blue_area = area
+
+        #     return False
+
+        self.last_blue_area = area
 
         blue_pixels = 0 if mask is None else cv2.countNonZero(mask)
 
@@ -761,7 +830,7 @@ class RobotCommander(Node):
         if not found:
             job["lost_frames"] += 1
 
-            if job["lost_frames"] < 40:
+            if job["lost_frames"] < 10:
                 return False
 
             self._drive(0.0, 0.2)
@@ -775,21 +844,26 @@ class RobotCommander(Node):
         junction = path_count >= 2
 
         if junction:
-            if right:
-                target_x = width * 0.75
-            elif middle:
-                target_x = width * 0.50
+            if left:
+                target_x = width * 0.10
             else:
-                target_x = width * 0.25
+                target_x = cx
 
         else:
             target_x = cx
 
-        err = target_x - width / 2
+        raw_err = target_x - width / 2
 
-        linear_speed = 0.15
+        self.line_error = (
+            0.5 * self.line_error +
+            0.5 * raw_err
+        )
+
+        err = self.line_error
         angular_speed = -0.003 * err
-
+        turn_amount = min(abs(err) / (width / 2), 1.0)
+        linear_speed = 0.40 - 0.30 * turn_amount
+        linear_speed = max(0.10, linear_speed)
         self._drive(linear_speed, angular_speed)
 
         return False
@@ -1065,6 +1139,9 @@ class RobotCommander(Node):
 
     def _topCameraCallback(self, msg):
         self.latest_top_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+
+        cv2.imshow("TOP CAMERA", self.latest_top_image)
+        cv2.waitKey(1)
 
     def _frontCameraCallback(self, msg):
         self.latest_front_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")

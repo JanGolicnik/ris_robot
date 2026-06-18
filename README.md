@@ -16,7 +16,7 @@ Should do:
 - [ ] Gender recognition (1 pt)
 - [ ] Auton. space exploration (1 pt)
 - [ ] Not crossing yellow line (2 pts)
-- [ ] Follow blue line (2 pts)
+- [x] Follow blue line (2 pts)
 - [ ] Correct cell detection (1 pt)
 - [x] Tile detection (1 pt)
 - [x] Defect detection (3 pt)

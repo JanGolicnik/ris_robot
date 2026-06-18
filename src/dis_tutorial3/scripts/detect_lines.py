@@ -20,7 +20,7 @@ class LineDetector:
         h, w = image.shape[:2]
 
         # only lower part of image
-        roi = image[int(h * 0.70):, :]
+        roi = image[int(h * 0.15):, :]
 
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
@@ -46,7 +46,7 @@ class LineDetector:
         )
 
         if not contours:
-            return False, None, None, None, mask, False, False, False
+            return False, None, None, None, mask, False, False, False, 0
 
         # choose contour closest to image center
         best = None
@@ -73,7 +73,9 @@ class LineDetector:
                 best = c
 
         if best is None:
-            return False, None, None, None, mask, False, False, False
+            return False, None, None, None, mask, False, False, False, 0
+        
+        area = cv2.contourArea(best)
 
         rect = cv2.minAreaRect(best)
 
@@ -81,7 +83,7 @@ class LineDetector:
         angle = rect[2]
 
         cx = int(center[0])
-        cy = int(center[1]) + int(h * 0.70)
+        cy = int(center[1]) + int(h * 0.15)
 
         # junction detection
         junction_roi = mask[int(mask.shape[0] * 0.25):, :]
@@ -100,9 +102,9 @@ class LineDetector:
             junction_roi[:, 2 * third:]
         )
 
-        left_exists = left_pixels > 200
-        center_exists = center_pixels > 200
-        right_exists = right_pixels > 200
+        left_exists = left_pixels > 300
+        center_exists = center_pixels > 300
+        right_exists = right_pixels > 300
 
         cv2.imshow("line mask", mask)
 
@@ -115,4 +117,5 @@ class LineDetector:
             left_exists,
             center_exists,
             right_exists,
+            area,
         )
