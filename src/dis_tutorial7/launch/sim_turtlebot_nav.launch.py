@@ -31,12 +31,12 @@ ARGUMENTS = [
                           description='Robot namespace'),
     DeclareLaunchArgument('rviz', default_value='true',
                           choices=['true', 'false'], description='Start rviz.'),
-    DeclareLaunchArgument('world', default_value='task2_blue_demo',
+    DeclareLaunchArgument('world', default_value='task2_delay',
                           description='Ignition World'),
     DeclareLaunchArgument('model', default_value='standard',
                           choices=['standard', 'lite'],
                           description='Turtlebot4 Model'),
-    DeclareLaunchArgument('map', default_value='torture_map.yaml',
+    DeclareLaunchArgument('map', default_value='danD.yaml',
                           description='Full path to map yaml file to load'),
 ]
 
