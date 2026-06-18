@@ -46,7 +46,7 @@ class Task(Enum):
     FIND_RINGS = 3
     FIND_BARRELS = 4
     INSPECT_BELT = 5
-    GOTO_POINT = 6
+    FOLLOW_BLUE = 6
 
 
 class TaskResult(Enum):
@@ -110,6 +110,11 @@ class RobotCommander(Node):
         self.anomaly_detector = AnomalyDetector()
         self.line_detector = LineDetector()
         self.target_line = "yellow"
+
+        self.turning_left = False
+        self.turn_start = 0
+        self.blue_done = False
+        self.blue_line_start = (2.75, -0.75)
 
         self.bridge = CvBridge()
         self.latest_top_image = None
@@ -191,15 +196,16 @@ class RobotCommander(Node):
             Task.FIND_RINGS: self.start_find_rings,
             Task.FIND_BARRELS: self.start_find_barrels,
             Task.INSPECT_BELT: self.start_inspect_belt,
+            Task.FOLLOW_BLUE: self.start_follow_blue,
         }
 
         self.JOB_UPDATE = {
-            Task.EXPLORE: self.done_task_complete,
-            Task.GOTO_FACE: self.done_task_complete,
-            Task.GOTO_POINT: self.done_task_complete,
-            Task.FIND_RINGS: self.done_task_complete,
-            Task.FIND_BARRELS: self.done_task_complete,
-            Task.INSPECT_BELT: self.done_task_complete,
+            Task.EXPLORE: self.update_task_complete,
+            Task.GOTO_FACE: self.update_task_complete,
+            Task.FIND_RINGS: self.update_task_complete,
+            Task.FIND_BARRELS: self.update_task_complete,
+            Task.INSPECT_BELT: self.update_inspect_belt,
+            Task.FOLLOW_BLUE: self.update_follow_blue,
         }
 
         self.JOB_DONE = {
@@ -210,6 +216,7 @@ class RobotCommander(Node):
             Task.FIND_RINGS: self.done_find_rings,
             Task.FIND_BARRELS: self.done_find_barrels,
             Task.INSPECT_BELT: self.done_inspect_belt,
+            Task.FOLLOW_BLUE: self.done_follow_blue,
         }
 
         self.info("Robot commander initialized")
@@ -294,6 +301,10 @@ class RobotCommander(Node):
         )
         if face is not None:
             return {"type": Task.GOTO_FACE, "face": face}
+        if not self.exploration_done():
+            return {"type": Task.EXPLORE}
+        if not getattr(self, "blue_done", False):
+            return {"type": Task.FOLLOW_BLUE}
         return None
 
     def exploration_done(self):
@@ -318,7 +329,7 @@ class RobotCommander(Node):
                 self.info(f"remembered {color} belt at {self.belt_positions[color]}")
 
     # if a task needs to wait for nav / rotation
-    def done_task_complete(self, job):
+    def update_task_complete(self, job):
         return self.isTaskComplete()
 
     # set the next waypoint to visit
@@ -442,7 +453,7 @@ class RobotCommander(Node):
             return False
 
         img = self.latest_front_image
-        found, cx, cy, angle, _ = self.line_detector.find_line(img, self.target_line)
+        found, cx, cy, angle, mask, left, center, right, _ = self.line_detector.find_line(img, self.target_line)
 
         if not found:
             job["lost_frames"] += 1
@@ -466,6 +477,93 @@ class RobotCommander(Node):
             self.warn(f"anomaly #{job['anomalies']} on {job['color']} belt")
 
         return False
+
+    def done_inspect_belt(self, job, result):
+        self._stop()
+        self.say(
+            f"Finished the {job['color']} belt. I found {job['anomalies']} anomalies."
+        )
+
+    def start_follow_blue(self, job):
+        x, y = self.blue_line_start
+        self.nav2_pose(
+            self._pose(
+                np.array([x, y, 0.0]),
+                0.0
+            )
+        )
+        job["phase"] = "goto_start"
+
+    def update_follow_blue(self, job):
+
+        if job["phase"] == "goto_start":
+            if not self.isTaskComplete():
+                return False
+
+            job["phase"] = "follow"
+            return False
+
+        if job["phase"] == "spinning":
+            if not self.isTaskComplete():
+                return False
+
+            job["phase"] = "follow"
+            return False
+
+        if job["phase"] == "follow":
+            cto = next(
+                (
+                    f
+                    for f in self.detected_faces
+                    if "cto" in f["job"].lower()
+                ),
+                None
+            )
+
+            if cto is not None:
+                self._stop()
+                self.info("CTO found")
+                return True
+
+            img = self.latest_front_image
+
+            if img is None:
+                return False
+
+            found, cx, cy, angle, mask, left, center, right, qr = \
+                self.line_detector.find_line(img, "blue")
+
+            if qr: # TODO: perhaps da damo "seen qr", da ne zacne loopat
+                self._stop()
+                self.say(str(qr))
+                self.spin(math.pi)
+
+                job["phase"] = "spinning"
+                return False
+
+            if not found:
+                self._stop()
+                self.spin(math.pi)
+
+                job["phase"] = "spinning"
+                return False
+
+            err = cx - img.shape[1] / 2
+
+            tw = Twist()
+            tw.linear.x = 0.15
+            tw.angular.z = -0.003 * err
+
+            self.cmd_vel_pub.publish(tw)
+
+            return False
+            
+    def done_follow_blue(self, job, result): # TODO: actually print the damn pdf
+        self._stop()
+        self.blue_done = True
+        self.say(
+            f"I found the CTO. I detected {len(self.detected_rings)} rings and {len(self.detected_barrels)} barrels."
+        )
 
     def _task_phrase(self, task):
         return {
