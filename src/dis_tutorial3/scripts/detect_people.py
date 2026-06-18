@@ -136,6 +136,7 @@ class detect_faces(Node):
         self.bridge = CvBridge()
         self.cv_image = None
         self.faces = []
+        self.frame_i = 0
 
         self.get_logger().info("Loading insightface (detection + recognition)...")
         self.app = load_face_app(self.device)
@@ -168,6 +169,9 @@ class detect_faces(Node):
         self.get_logger().info("Node initialized.")
 
     def rgb_callback(self, data):
+        self.frame_i += 1
+        if self.frame_i % 5 != 0:
+            return
         try:
             cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
         except CvBridgeError as e:

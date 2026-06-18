@@ -273,12 +273,10 @@ class RobotCommander(Node):
 
         self.info("Robot commander initialized")
 
-    # read the rviz-exported waypoints; each has a pose and an optional orientation
     def load_waypoints(self, path):
         with open(path, "r") as f:
             data = yaml.safe_load(f) or {}
         raw = data.get("waypoints", {})
-        # keys are waypoint0, waypoint1, ... sort by their numeric suffix
         keys = sorted(raw, key=lambda k: int("".join(c for c in k if c.isdigit()) or 0))
         wps = []
         for k in keys:
@@ -288,11 +286,6 @@ class RobotCommander(Node):
             orient = wp.get("orientation")
             yaw = None
             if orient is not None:
-                # NOTE: the rviz export packs the yaw into orientation[0] (the z
-                # component) and keeps w last; the middle two are 0 for a ground
-                # robot. Reconstruct a clean yaw from those two. Verify the heading
-                # at waypoint0/1 once on the robot, the order is nonstandard so a
-                # wrong guess would flip the facing.
                 qz, qw = float(orient[0]), float(orient[3])
                 yaw = 2.0 * math.atan2(qz, qw)
             wps.append({"x": x, "y": y, "yaw": yaw})
@@ -337,25 +330,43 @@ class RobotCommander(Node):
             self.info(f"done job {job}")
             done(job, self.getResult())
 
+    def next_person(self):
+        robot_pos = np.array(
+            [
+                self.current_pose.pose.position.x,
+                self.current_pose.pose.position.y,
+                0.0,
+            ]
+        )
+
+        candidates = [
+            f
+            for f in self.detected_faces
+            if not f["greeted"]
+            and f["attempts"] < self.MAX_GREET_ATTEMPTS
+            and np.linalg.norm(f["position"] - robot_pos) <= 2.5
+        ]
+
+        face = min(
+            candidates,
+            key=lambda f: np.linalg.norm(f["position"] - robot_pos),
+            default=None,
+        )
+
+        return face
+
     # get the next queued job, then patrol every waypoint, and only then visit known faces
     def next_job(self):
         if self.job_queue:
             return self.job_queue.pop(0)
         if not self.exploration_done():
             return {"type": Task.EXPLORE}
-        face = next(
-            (
-                f
-                for f in self.detected_faces
-                if not f["greeted"] and f["attempts"] < self.MAX_GREET_ATTEMPTS
-            ),
-            None,
-        )
+        face = self.next_person()
         if face is not None:
             return {"type": Task.GOTO_FACE, "face": face}
-        return {"type": Task.INSPECT_BELT, "color": "green"}
-        # if not getattr(self, "blue_done", False):
-        #     return {"type": Task.FOLLOW_BLUE}
+        # return {"type": Task.INSPECT_BELT, "color": "green"}
+        if not getattr(self, "blue_done", False):
+            return {"type": Task.FOLLOW_BLUE}
         return None
 
     def exploration_done(self):

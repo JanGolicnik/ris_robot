@@ -3,16 +3,16 @@
 ## Task2
 
 Must do:
-- [ ] Goal-based navigation (1 pt)
+- [x] Goal-based navigation (1 pt)
 - [x] Face detection (2 pts) 
 - [x] Ring detection (2 pts)
 - [x] Cylinder detection (2 pts)
 - [x] Colour recognition (1 pt)
 - [x] Approaching faces (1 pt)
-- [ ] Speech synthesis (1 pt)
+- [x] Speech synthesis (1 pt)
 
 Should do:
-- [ ] Face recognition (1 pt)
+- [x] Face recognition (1 pt)
 - [ ] Gender recognition (1 pt)
 - [ ] Auton. space exploration (1 pt)
 - [ ] Not crossing yellow line (2 pts)
@@ -20,7 +20,7 @@ Should do:
 - [ ] Correct cell detection (1 pt)
 - [x] Tile detection (1 pt)
 - [x] Defect detection (3 pt)
-- [ ] Dialogue with ASR (2 pts)
+- [ ] Dialogue with ASR (2 pts) MUST DO !!!
 - [ ] Creating the inspection report (1 pt)
 
 
