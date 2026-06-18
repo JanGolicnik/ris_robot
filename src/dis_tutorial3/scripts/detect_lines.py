@@ -9,7 +9,7 @@ COLOR_RANGES = {
         (np.array([170, 100, 50]), np.array([180, 255, 255])),
     ],
     "green": [(np.array([50, 120, 120]), np.array([80, 255, 255]))],
-    "blue": [(np.array([90, 50, 50]), np.array([120, 255, 255]))],
+    "blue": [(np.array([90, 90, 150]), np.array([110, 255, 255]))],
     "yellow": [(np.array([20, 120, 120]), np.array([40, 255, 255]))],
 }
 
@@ -19,11 +19,10 @@ class LineDetector:
 
         h, w = image.shape[:2]
 
-        # only bottom part of image
-        roi = image[int(h * 0.5) :, :]
+        # only lower part of image
+        roi = image[int(h * 0.70):, :]
 
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        cv2.imshow("hsv", hsv)
 
         mask = None
 
@@ -35,39 +34,71 @@ class LineDetector:
             else:
                 mask = cv2.bitwise_or(mask, current)
 
-        # connect broken line pieces
-        mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+        # clean mask
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.dilate(mask, kernel, iterations=1)
+        mask = cv2.erode(mask, kernel, iterations=1)
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
 
         if not contours:
-            return False, None, None, None, mask, None, None, None
+            return False, None, None, None, mask, False, False, False
 
-        largest = max(contours, key=cv2.contourArea)
+        # choose contour closest to image center
+        best = None
+        best_score = float("inf")
 
-        x, y, bw, bh = cv2.boundingRect(largest)
+        for c in contours:
 
-        # reject tiny garbage
-        if bw < 30:
-            return False, None, None, None, mask, None, None, None
+            area = cv2.contourArea(c)
 
-        rect = cv2.minAreaRect(largest)
+            if area < 100:
+                continue
+
+            M = cv2.moments(c)
+
+            if M["m00"] == 0:
+                continue
+
+            cx = int(M["m10"] / M["m00"])
+
+            score = abs(cx - mask.shape[1] // 2)
+
+            if score < best_score:
+                best_score = score
+                best = c
+
+        if best is None:
+            return False, None, None, None, mask, False, False, False
+
+        rect = cv2.minAreaRect(best)
 
         center = rect[0]
         angle = rect[2]
 
         cx = int(center[0])
-        cy = int(center[1]) + int(h * 0.5)
+        cy = int(center[1]) + int(h * 0.70)
 
-        # dodatek za junction detection, samo pogleda piksle pa ce so poti levo, naravnost...
-        bottom = mask[-40:, :]
-        third = bottom.shape[1] // 3
+        # junction detection
+        junction_roi = mask[int(mask.shape[0] * 0.25):, :]
 
-        left_pixels = cv2.countNonZero(bottom[:, :third])
+        third = junction_roi.shape[1] // 3
 
-        center_pixels = cv2.countNonZero(bottom[:, third : 2 * third])
+        left_pixels = cv2.countNonZero(
+            junction_roi[:, :third]
+        )
 
-        right_pixels = cv2.countNonZero(bottom[:, 2 * third :])
+        center_pixels = cv2.countNonZero(
+            junction_roi[:, third:2 * third]
+        )
+
+        right_pixels = cv2.countNonZero(
+            junction_roi[:, 2 * third:]
+        )
 
         left_exists = left_pixels > 200
         center_exists = center_pixels > 200
@@ -75,4 +106,13 @@ class LineDetector:
 
         cv2.imshow("line mask", mask)
 
-        return (True, cx, cy, angle, mask, left_exists, center_exists, right_exists)
+        return (
+            True,
+            cx,
+            cy,
+            angle,
+            mask,
+            left_exists,
+            center_exists,
+            right_exists,
+        )

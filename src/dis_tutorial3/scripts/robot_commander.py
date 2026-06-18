@@ -488,66 +488,149 @@ class RobotCommander(Node):
 
     def start_follow_blue(self, job):
         x, y = self.blue_line_start
-        self.nav2_pose(self._pose(np.array([x, y, 0.0]), math.pi * 1.5))
+        job.setdefault("seen_qrs", set())
+
+        self.nav2_pose(
+            self._pose(
+                np.array([x, y, 0.0]),
+                math.pi * 1.5
+            )
+        )
+
         job["phase"] = "goto_start"
+        job["lost_frames"] = 0
 
     def update_follow_blue(self, job):
 
         if job["phase"] == "goto_start":
+
             if not self.isTaskComplete():
                 return False
 
             job["phase"] = "follow"
+            job["lost_frames"] = 0
             return False
 
         if job["phase"] == "spinning":
+
             if not self.isTaskComplete():
                 return False
 
             job["phase"] = "follow"
+            job["lost_frames"] = 0
             return False
 
-        if job["phase"] == "follow":
-            cto = next(
-                (f for f in self.detected_faces if "cto" in f["job"].lower()), None
-            )
+        if job["phase"] != "follow":
+            return False
 
-            if cto is not None:
-                self._stop()
-                self.info("CTO found")
-                return True
+        cto = next(
+            (
+                f for f in self.detected_faces
+                if "cto" in f["job"].lower()
+            ),
+            None
+        )
 
-            img = self.latest_front_image
-            cv2.imshow("img", img)
+        if cto is not None:
 
-            if img is None:
-                return False
+            self._stop()
 
-            found, cx, cy, angle, mask, left, middle, right = (
-                self.line_detector.find_line(img, "blue")
-            )
+            self.enqueue({
+                "type": Task.GOTO_FACE,
+                "face": cto
+            })
+
+            self.info("CTO found")
+            return True
+
+        img = self.latest_front_image
+
+        if img is None:
+            return False
+
+        found, cx, cy, angle, mask, left, middle, right = (
+            self.line_detector.find_line(img, "blue")
+        )
+
+        blue_pixels = 0 if mask is None else cv2.countNonZero(mask)
+
+        print(f"blue pixels: {blue_pixels}")
+
+        if found and blue_pixels < 1200:
+
+            self._stop()
+            time.sleep(0.5)
 
             qr = self.read_qr()
 
-            if qr:  # TODO: perhaps da damo "seen qr", da ne zacne loopat
-                self._stop()
-                self.say(str(qr))
-                self.spin(math.pi)
+            if qr and qr not in job["seen_qrs"]:
 
-                job["phase"] = "spinning"
-                return False
+                job["seen_qrs"].add(qr)
 
-            if not found:
-                self._stop()
-                self.spin(math.pi * 0.1)
+                self.say(qr)
 
-                job["phase"] = "spinning"
-                return False
+            cto = next(
+                (
+                    f for f in self.detected_faces
+                    if "cto" in f["job"].lower()
+                ),
+                None
+            )
 
-            err = cx - img.shape[1] / 2
+            if cto is not None:
 
-            self._drive(0.15, 0.003 * err)
+                self.enqueue({
+                    "type": Task.GOTO_FACE,
+                    "face": cto
+                })
+
+                self.info("CTO found")
+                return True
+
+            self.spin(math.pi)
+
+            job["phase"] = "spinning"
+            job["lost_frames"] = 0
+
             return False
+
+        if not found:
+
+            job["lost_frames"] += 1
+
+            if job["lost_frames"] < 40:
+                return False
+
+            self._drive(0.0, 0.2)
+            return False
+
+        job["lost_frames"] = 0
+
+        width = img.shape[1]
+
+        path_count = int(left) + int(middle) + int(right)
+        junction = path_count >= 2
+
+        if junction:
+
+            if right:
+                target_x = width * 0.75
+            elif middle:
+                target_x = width * 0.50
+            else:
+                target_x = width * 0.25
+
+        else:
+            target_x = cx
+
+        err = target_x - width / 2
+
+        linear_speed = 0.15
+        angular_speed = -0.003 * err
+
+        self._drive(linear_speed, angular_speed)
+
+        return False
 
     def done_follow_blue(self, job, result):  # TODO: actually print the damn pdf
         self._stop()
@@ -653,7 +736,7 @@ class RobotCommander(Node):
         return TaskResult.UNKNOWN
 
     def _stop(self):
-        self.cmd_vel_pub.publish(Twist())
+        self.cmd_vel_pub.publish(TwistStamped())
 
     def _feedbackCallback(self, msg):
         self.feedback = msg.feedback
