@@ -119,12 +119,13 @@ class RingDetector(Node):
         colors = []
         for h, s, v in pixels:
             if s < 100:
-                if v < 60:
-                    colors.append("black")
-            elif h < 10 or h > 160:
+                # colors.append("black")
+                colors.append("unknown")
+            if h < 10 or h > 160:
                 colors.append("red")
             elif h < 25:
-                colors.append("orange")
+                # colors.append("orange")
+                colors.append("unknown")
             elif h < 35:
                 colors.append("yellow")
             elif h < 85:
@@ -132,7 +133,8 @@ class RingDetector(Node):
             elif h < 130:
                 colors.append("blue")
             elif h < 160:
-                colors.append("purple")
+                # colors.append("purple")
+                colors.append("unknown")
             else:
                 colors.append("unknown")
 
@@ -405,6 +407,8 @@ class RingDetector(Node):
         ring_color_img = cv_image.copy()
         for le, se in candidates:
             color = self.get_ring_color(ring_color_img, (le, se))
+            if color == "unknown":
+                continue
             cx, cy = int(le[0][0]), int(le[0][1])
             pos = self.get_3d_position(cx, cy, le)
 

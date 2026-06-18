@@ -96,30 +96,27 @@ class RobotCommander(Node):
     BELT_LOST_LIMIT = 15
     ANOMALY_COOLDOWN = 1.0
 
-    BELT_LANE_OFFSET = (
-        0.0  # m, lateral offset from the line to the driving lane (0 = on the line)
-    )
-    BELT_SIDE = 1  # +1 / -1, which side of the line the lane sits on (only matters if offset != 0)
-    BELT_MAX_RANGE = (
-        3.0  # m, drop projected points further than this (shallow rays are noisy)
-    )
-    BELT_MIN_POINTS = 30  # need at least this many accumulated points to trust a fit
-    BELT_MIN_LENGTH = 0.3  # m, reject a fit shorter than this
-    BELT_MAX_POINTS = 4000  # cap stored points per color
-    BELT_POINT_STRIDE = 20  # subsample stride over the line mask pixels each frame
+    BELT_LANE_OFFSET = 0.0
+    BELT_SIDE = 1
+    BELT_MAX_RANGE = 3.0
+    BELT_MIN_POINTS = 30
+    BELT_MIN_LENGTH = 0.3
+    BELT_MAX_POINTS = 4000
+    BELT_POINT_STRIDE = 20
 
-    BELT_FORWARD_SPEED = 0.75  # m/s while following the line
-    BELT_TURN_SPEED = 0.5  # rad/s for the 90 deg turn (negative = right/CW)
-    BELT_STRAIGHT_SECS_RED = (
-        10.0  # how long to drive straight after the turn (your "amount")
-    )
-    BELT_STRAIGHT_SECS_GREEN = (
-        15.0  # how long to drive straight after the turn (your "amount")
-    )
+    BELT_FORWARD_SPEED = 0.75
+    BELT_TURN_SPEED = 0.5
+    BELT_STRAIGHT_SECS_GREEN = 10.0
+    BELT_STRAIGHT_SECS_RED = 17.0
     BELT_COLOR_LOST_FRAMES = 10
+
+    GOTO_POINT_STANDOFF = 3.0
 
     def __init__(self):
         super().__init__("robot_commander")
+
+        self.report_entries = []
+        self._current_entry = None
 
         self.current_pose = None
 
@@ -389,12 +386,12 @@ class RobotCommander(Node):
             for f in self.detected_faces
             if not f["greeted"]
             and f["attempts"] < self.MAX_GREET_ATTEMPTS
-            and np.linalg.norm(f["position"] - robot_pos) <= 2.5
+            and np.linalg.norm(f["pos"] - robot_pos) <= 2.5
         ]
 
         face = min(
             candidates,
-            key=lambda f: np.linalg.norm(f["position"] - robot_pos),
+            key=lambda f: np.linalg.norm(f["pos"] - robot_pos),
             default=None,
         )
 
@@ -409,9 +406,9 @@ class RobotCommander(Node):
         face = self.next_person()
         if face is not None:
             return {"type": Task.GOTO_FACE, "face": face}
-        # return {"type": Task.INSPECT_BELT, "color": "green"}
-        if not getattr(self, "blue_done", False):
-            return {"type": Task.FOLLOW_BLUE}
+        return {"type": Task.INSPECT_BELT, "color": "green"}
+        # if not getattr(self, "blue_done", False):
+        #     return {"type": Task.FOLLOW_BLUE}
         return None
 
     def exploration_done(self):
@@ -459,11 +456,11 @@ class RobotCommander(Node):
 
     # fit a straight line to the accumulated points; returns (lane_start, lane_end, yaw) or None
     def _fit_belt(self, color):
-        if color == "red":
+        if color == "green":
             start = np.array([0.35, -4.29])
             end = np.array([0.415, -4.29])
             yaw = math.pi * 1.55
-        elif color == "green":
+        elif color == "red":
             start = np.array([-4.22, -2.72])
             end = np.array([-4.65, 0.23])
             yaw = math.pi
@@ -550,7 +547,8 @@ class RobotCommander(Node):
     def done_converse(self, job, result):
         face = job["face"]
         face["greeted"] = True
-        self.say(f"Hello {face['name']}, the {face['job']}.")
+        gender = "woman" if face["pronouns"] in ("she/her") else "man"
+        self.say(f"Hello {face['name']} {gender}, the {face['job']}.")
 
         task = parse_instruction(self.read_qr())
         if task is None:
@@ -558,6 +556,7 @@ class RobotCommander(Node):
             self.warn("invalid qr")
             return
         self.say(f"OK. I will {self._task_phrase(task)}.")
+        task["face"] = face
         self.enqueue(task)
 
     # navigate to a single point, optional yaw, used for rings / barrels / belt spot
@@ -568,12 +567,31 @@ class RobotCommander(Node):
         self.publish_goal_marker(float(pos[0]), float(pos[1]))
         self.nav2_pose(self._pose(pos, yaw))
 
+    def update_goto_point(self, job):
+        if self.current_pose is not None:
+            robot = np.array(
+                [
+                    self.current_pose.pose.position.x,
+                    self.current_pose.pose.position.y,
+                    0.0,
+                ]
+            )
+            dist = np.linalg.norm(job["pos"] - robot)
+            if dist <= self.GOTO_POINT_STANDOFF:
+                self.cancelTask()
+                return True
+        return self.isTaskComplete()
+
     def done_goto_point(self, job, result):
         label = job.get("label", "point")
         if result == TaskResult.SUCCEEDED:
             self.info(f"reached {label}")
         else:
             self.warn(f"could not reach {label}")
+
+    def cancelTask(self):
+        if self.goal_handle is not None:
+            self.goal_handle.cancel_goal_async()
 
     # queue a visit to every ring found during the patrol
     def start_find_rings(self, job):
@@ -588,7 +606,16 @@ class RobotCommander(Node):
             )
 
     def done_find_rings(self, job, result):
-        self.say(f"I will visit {len(self.detected_rings)} rings.")
+        self.report_start_task("Find Rings", face=job.get("face"))
+        self.report_add_note(f"Total rings found: {len(self.detected_rings)}")
+        for ring in self.detected_rings:
+            self.report_add(
+                type="ring",
+                color=ring["color"],
+                pos=ring["pos"],
+                image_bytes=ring.get("image_bytes"),
+            )
+        self.say(f"Found {len(self.detected_rings)} rings.")
 
     # queue a visit to every barrel found during the patrol
     def start_find_barrels(self, job):
@@ -603,7 +630,17 @@ class RobotCommander(Node):
             )
 
     def done_find_barrels(self, job, result):
-        self.say(f"I will visit {len(self.detected_barrels)} barrels.")
+        self.report_start_task("Find Barrels", face=job.get("face"))
+        self.report_add_note(f"Total barrels found: {len(self.detected_barrels)}")
+        for barrel in self.detected_barrels:
+            self.report_add(
+                type="barrel",
+                color=barrel["color"],
+                orientation=barrel["orientation"],
+                pos=barrel["pos"],
+                image_bytes=barrel.get("image_bytes"),
+            )
+        self.say(f"found {len(self.detected_barrels)} barrels.")
 
     # fit the belt line from the patrol points, drive to its near end, then along it
     def start_inspect_belt(self, job):
@@ -662,7 +699,7 @@ class RobotCommander(Node):
 
         if job["phase"] == "turn":
             turned = abs(self._angle_diff(self._current_yaw(), job["turn_start_yaw"]))
-            if turned >= math.pi * 0.55:
+            if turned >= math.pi * 0.5:
                 self._stop()
                 job["phase"] = "straight"
                 job["straight_start"] = time.time()
@@ -681,12 +718,21 @@ class RobotCommander(Node):
                     if job["color"] == "green"
                     else self.BELT_STRAIGHT_SECS_RED
                 )
-                if self.latest_front_image is not None:
+                if self.latest_top_image is not None:
+                    img = self.latest_top_image
+                    h, w = img.shape[:2]
+
+                    right_half = img[:, w // 2 :]
+                    cv2.imshow("DESNA", right_half)
+
                     found, *_ = self.line_detector.find_line(
-                        self.latest_front_image, job["color"]
+                        right_half,
+                        job["color"],
                     )
                     if found:
-                        turn_rate = self.BELT_TURN_SPEED * 0.2
+                        turn_rate = self.BELT_TURN_SPEED * 0.5
+                    else:
+                        turn_rate = -self.BELT_TURN_SPEED * 0.5
 
             if time.time() - job["straight_start"] >= move_time:
                 self._stop()
@@ -698,6 +744,7 @@ class RobotCommander(Node):
                     job["final_turn"] = True
                 return False
 
+            print(f"TURN RATE JE {turn_rate}")
             self._drive(self.BELT_FORWARD_SPEED, turn_rate)
             return False
 
@@ -708,6 +755,11 @@ class RobotCommander(Node):
         if now - job["last_anomaly_t"] > self.ANOMALY_COOLDOWN and self._belt_anomaly():
             job["anomalies"] += 1
             job["last_anomaly_t"] = now
+            job.setdefault("anomaly_images", [])
+            if self.latest_top_image is not None:
+                job["anomaly_images"].append(
+                    cv2.imencode(".jpg", self.latest_top_image)[1].tobytes()
+                )
             self.warn(f"anomaly #{job['anomalies']} on {job['color']} belt")
 
     def _angle_diff(self, a, b):
@@ -719,6 +771,12 @@ class RobotCommander(Node):
         if not job.get("fitted", False):
             self.say(f"I could not find the {job['color']} belt.")
             return
+        self.report_start_task(
+            f"Inspect {job['color'].capitalize()} Belt", face=job.get("face")
+        )
+        self.report_add_note(f"Anomalies found: {job['anomalies']}")
+        for img_bytes in job.get("anomaly_images", []):
+            self.report_add(type="anomaly", image_bytes=img_bytes)
         self.say(
             f"Finished the {job['color']} belt. I found {job['anomalies']} anomalies."
         )
@@ -903,7 +961,7 @@ class RobotCommander(Node):
         h_full = img.shape[0]
         w_full = img.shape[1]
         img = img[
-            int(h_full * 0.25) : int(h_full * 0.8),
+            int(h_full * 0.32) : int(h_full * 0.8),
             int(w_full * 0.2) : int(w_full * 0.8),
         ]
         cv2.imshow("img", img)
@@ -1025,9 +1083,9 @@ class RobotCommander(Node):
         confirmed,
         pos,
         fields,
-        min_count=5,
+        min_count=10,
         window=2.0,
-        merge_dist=0.5,
+        merge_dist=3.0,
     ):
         now = time.time()
         if any(np.linalg.norm(pos - r["pos"]) < merge_dist for r in confirmed):
@@ -1090,7 +1148,7 @@ class RobotCommander(Node):
                 f["name"] = msg.name
                 f["job"] = msg.job
                 f["pronouns"] = msg.pronouns
-                print("face already in")
+                # print("face already in")
                 return
 
         rec = self._update_candidate(
@@ -1107,9 +1165,16 @@ class RobotCommander(Node):
         if rec is not None:
             rec["greeted"] = False
             rec["attempts"] = 0
+            if self.latest_front_image is not None:
+                rec["image_bytes"] = self.screenshot()
+            else:
+                rec["image_bytes"] = None
             self.info(f"CONFIRMED face at {rec['pos']}")
-        else:
-            print("face not detected enough")
+        # else:
+        #     print("face not detected enough")
+
+    def screenshot(self):
+        return cv2.imencode(".jpg", self.latest_front_image)[1].tobytes()
 
     def _ringCallback(self, msg):
         pos = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
@@ -1120,6 +1185,10 @@ class RobotCommander(Node):
             {"color": msg.header.frame_id},
         )
         if rec is not None:
+            if self.latest_front_image is not None:
+                rec["image_bytes"] = self.screenshot()
+            else:
+                rec["image_bytes"] = None
             self.info(f"CONFIRMED ring: {rec['color']}")
 
     def _barrelCallback(self, msg):
@@ -1133,8 +1202,13 @@ class RobotCommander(Node):
             self.detected_barrels,
             pos,
             {"color": color, "orientation": orientation},
+            merge_dist=0.5,
         )
         if rec is not None:
+            if self.latest_front_image is not None:
+                rec["image_bytes"] = self.screenshot()
+            else:
+                rec["image_bytes"] = None
             self.info(f"CONFIRMED barrel: {rec['color']} {rec['orientation']}")
 
     def _topCameraCallback(self, msg):
@@ -1261,6 +1335,131 @@ class RobotCommander(Node):
 
     def error(self, msg):
         self.get_logger().error(msg)
+
+    def report_start_task(self, task_name: str, face=None):
+        self._current_entry = {
+            "task_name": task_name,
+            "face": {
+                "name": face.get("name"),
+                "job": face.get("job"),
+                "pronouns": face.get("pronouns"),
+                "image_bytes": face.get("image_bytes"),
+            }
+            if face
+            else None,
+            "items": [],  # list of dicts, structure depends on task
+        }
+        self.report_entries.append(self._current_entry)
+
+    def report_add(self, **kwargs):
+        if self._current_entry is None:
+            self.warn("report_add called with no active entry")
+            return
+        self._current_entry["items"].append(kwargs)
+
+    def report_add_note(self, text: str):
+        self.report_add(type="note", text=text)
+
+    def generate_report(self) -> bytes:
+        import os
+        import tempfile
+
+        from fpdf import FPDF
+
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.add_page()
+        pdf.set_font("Helvetica", "B", 20)
+        pdf.cell(0, 10, "Robot Mission Report", ln=True)
+        pdf.ln(5)
+
+        def put_image(img_bytes, w=70):
+            if not img_bytes:
+                return
+            tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+            try:
+                tmp.write(img_bytes)
+                tmp.flush()
+                pdf.image(tmp.name, w=w)
+            except Exception as e:
+                pdf.set_font("Helvetica", "", 10)
+                pdf.cell(0, 6, f"[image error: {e}]", ln=True)
+            finally:
+                tmp.close()
+                os.unlink(tmp.name)
+
+        for i, entry in enumerate(self.report_entries):
+            # task header
+            pdf.set_font("Helvetica", "B", 14)
+            pdf.cell(0, 10, f"Task {i + 1}: {entry['task_name']}", ln=True)
+            pdf.line(pdf.get_x(), pdf.get_y(), pdf.get_x() + 190, pdf.get_y())
+            pdf.ln(3)
+
+            # person block
+            face = entry.get("face")
+            if face:
+                pdf.set_font("Helvetica", "B", 11)
+                pdf.cell(0, 7, "Person:", ln=True)
+                pdf.set_font("Helvetica", "", 11)
+                pdf.cell(0, 6, f"  Name: {face.get('name', 'unknown')}", ln=True)
+                pdf.cell(0, 6, f"  Job: {face.get('job', 'unknown')}", ln=True)
+                pdf.cell(
+                    0, 6, f"  Pronouns: {face.get('pronouns', 'unknown')}", ln=True
+                )
+                put_image(face.get("image_bytes"), w=60)
+                pdf.ln(3)
+
+            # items
+            for item in entry.get("items", []):
+                t = item.get("type")
+
+                if t == "note":
+                    pdf.set_font("Helvetica", "I", 10)
+                    pdf.cell(0, 6, item.get("text", ""), ln=True)
+                    pdf.ln(1)
+
+                elif t == "ring":
+                    pdf.set_font("Helvetica", "B", 11)
+                    pdf.cell(0, 7, f"Ring — color: {item.get('color', '?')}", ln=True)
+                    pos = item.get("pos")
+                    if pos is not None:
+                        pdf.set_font("Helvetica", "", 10)
+                        pdf.cell(
+                            0, 6, f"  Position: ({pos[0]:.2f}, {pos[1]:.2f})", ln=True
+                        )
+                    put_image(item.get("image_bytes"))
+                    pdf.ln(3)
+
+                elif t == "barrel":
+                    pdf.set_font("Helvetica", "B", 11)
+                    pdf.cell(
+                        0,
+                        7,
+                        f"Barrel — color: {item.get('color', '?')}, orientation: {item.get('orientation', '?')}",
+                        ln=True,
+                    )
+                    pos = item.get("pos")
+                    if pos is not None:
+                        pdf.set_font("Helvetica", "", 10)
+                        pdf.cell(
+                            0, 6, f"  Position: ({pos[0]:.2f}, {pos[1]:.2f})", ln=True
+                        )
+                    put_image(item.get("image_bytes"))
+                    pdf.ln(3)
+
+                elif t == "anomaly":
+                    pdf.set_font("Helvetica", "B", 11)
+                    pdf.cell(0, 7, "Anomaly detected:", ln=True)
+                    put_image(item.get("image_bytes"))
+                    pdf.ln(3)
+
+                else:
+                    pdf.set_font("Helvetica", "", 10)
+                    pdf.cell(0, 6, f"[unknown item type: {t}]", ln=True)
+
+            pdf.ln(6)
+
+        return bytes(pdf.output())
 
 
 def main(args=None):

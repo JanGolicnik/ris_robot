@@ -1,49 +1,56 @@
 #!/usr/bin/env python3
 
+import cv2
 import numpy as np
 import rclpy
-import tf2_ros
 import tf2_geometry_msgs
-import cv2
+import tf2_ros
 from cv_bridge import CvBridge
-from geometry_msgs.msg import PointStamped, PoseStamped
+from geometry_msgs.msg import (
+    Point,
+    PointStamped,  # add to your geometry_msgs import
+    PoseStamped,
+    PoseWithCovarianceStamped,
+    Quaternion,
+    Twist,
+    TwistStamped,
+)
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data, QoSReliabilityPolicy, QoSProfile
+from rclpy.qos import (
+    QoSDurabilityPolicy,
+    QoSHistoryPolicy,
+    QoSProfile,
+    QoSReliabilityPolicy,
+    qos_profile_sensor_data,
+)
+from rclpy.time import Time
 from sensor_msgs.msg import Image, PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
 from visualization_msgs.msg import Marker
 
-#malo na vecje zaradi hi, lo spodaj, zaradi red
+# malo na vecje zaradi hi, lo spodaj, zaradi red
 COLOR_RANGES = {
     "red": [
         (np.array([0, 100, 50]), np.array([10, 255, 255])),
-        (np.array([170, 100, 50]), np.array([180, 255, 255]))
+        (np.array([170, 100, 50]), np.array([180, 255, 255])),
     ],
-    "green": [
-        (np.array([40, 50, 50]), np.array([90, 255, 255]))
-    ],
-    "blue": [
-        (np.array([95, 100, 80]), np.array([130, 255, 255]))
-    ],
-    "yellow": [
-        (np.array([18, 80, 80]), np.array([35, 255, 255]))
-    ],
-    "purple": [
-        (np.array([135, 50, 50]), np.array([165, 255, 255]))
-    ],
-    "orange": [
-        (np.array([9, 100, 50]), np.array([17, 255, 255]))
-    ],
-    "brown": [
-        (np.array([10, 80, 30]), np.array([20, 200, 150]))
-    ],
+    "green": [(np.array([40, 50, 50]), np.array([90, 255, 255]))],
+    "blue": [(np.array([95, 100, 80]), np.array([130, 255, 255]))],
+    "yellow": [(np.array([18, 80, 80]), np.array([35, 255, 255]))],
+    # "purple": [(np.array([135, 50, 50]), np.array([165, 255, 255]))],
+    # "orange": [(np.array([9, 100, 50]), np.array([17, 255, 255]))],
+    # "brown": [(np.array([10, 80, 30]), np.array([20, 200, 150]))],
+    "black": [(np.array([0, 0, 0]), np.array([180, 255, 50]))],
 }
 
-def detect_colored_regions(img_bgr,
-                           min_fill_ratio=0.55,
-                           inner_crop=0.6,
-                           min_contour_area=800,
-                           morph_kernel=(5,5)):
+
+def detect_colored_regions(
+    img_bgr,
+    min_fill_ratio=0.55,
+    inner_crop=0.6,
+    min_contour_area=800,
+    morph_kernel=(5, 5),
+):
 
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     detections = []
@@ -61,6 +68,8 @@ def detect_colored_regions(img_bgr,
 
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        if cname == "black":
+            cv2.imshow("black mask", mask)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in contours:
@@ -108,33 +117,43 @@ def detect_colored_regions(img_bgr,
 
             rect_mask = np.zeros((h, w), dtype=np.uint8)
             cv2.drawContours(rect_mask, [cnt - [x, y]], -1, 255, -1)
-            center_crop = rect_mask[cy0:cy0+ch, cx0:cx0+cw]
+            center_crop = rect_mask[cy0 : cy0 + ch, cx0 : cx0 + cw]
             center_fill = np.count_nonzero(center_crop) / (cw * ch + 1e-9)
             if center_fill < 0.75:
                 continue
 
-            orientation = "vertical" if h > 1.3 * w else ("horizontal" if w > 1.25 * h else "unknown")
+            orientation = (
+                "vertical"
+                if h > 1.3 * w
+                else ("horizontal" if w > 1.25 * h else "unknown")
+            )
+            if cname == "black" and orientation == "horizontal":
+                continue
             if orientation == "unknown":
                 continue
 
-            roi = hsv[y:y+h, x:x+w]
+            roi = hsv[y : y + h, x : x + w]
             roi_mask = rect_mask
-            hue_pixels = roi[:, :, 0][roi_mask == 255]
-            if len(hue_pixels) < 30:
-                continue
-            if np.std(hue_pixels) > 25:
-                continue
+            if cname != "black":
+                hue_pixels = roi[:, :, 0][roi_mask == 255]
+                if len(hue_pixels) < 30:
+                    continue
+                if np.std(hue_pixels) > 25:
+                    continue
 
-            detections.append({
-                "color": cname,
-                "bbox": (x, y, w, h),
-                "area": float(area),
-                "fill_ratio": float(fill),
-                "center_fill": float(center_fill),
-                "orientation": orientation,
-            })
+            detections.append(
+                {
+                    "color": cname,
+                    "bbox": (x, y, w, h),
+                    "area": float(area),
+                    "fill_ratio": float(fill),
+                    "center_fill": float(center_fill),
+                    "orientation": orientation,
+                }
+            )
 
     return detections
+
 
 class BarrelDetector(Node):
     def __init__(self):
@@ -145,26 +164,37 @@ class BarrelDetector(Node):
         self.candidates_in_image = []
 
         self.image_sub = self.create_subscription(
-            Image, "/oakd/rgb/preview/image_raw",
-            self.image_callback, qos_profile_sensor_data
+            Image,
+            "/oakd/rgb/preview/image_raw",
+            self.image_callback,
+            qos_profile_sensor_data,
         )
         self.pc_sub = self.create_subscription(
-            PointCloud2, "/oakd/rgb/preview/depth/points",
-            self.pointcloud_callback, qos_profile_sensor_data
+            PointCloud2,
+            "/oakd/rgb/preview/depth/points",
+            self.pointcloud_callback,
+            qos_profile_sensor_data,
         )
 
         qos = QoSProfile(depth=10)
         qos.reliability = QoSReliabilityPolicy.BEST_EFFORT
 
-        self.barrel_pub = self.create_publisher(
-            PoseStamped,
-            "/barrel_positions",
-            qos
-        )
+        self.barrel_pub = self.create_publisher(PoseStamped, "/barrel_positions", qos)
         self.marker_pub = self.create_publisher(Marker, "/barrel_marker", 10)
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.create_subscription(
+            PoseWithCovarianceStamped,
+            "amcl_pose",
+            self._amclPoseCallback,
+            QoSProfile(
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+            ),
+        )
 
         self.get_logger().info("Barrel detector started")
 
@@ -175,7 +205,13 @@ class BarrelDetector(Node):
             self.get_logger().error(f"cv_bridge error: {e}")
             return
 
-        detections = detect_colored_regions(cv_image, min_fill_ratio=0.55, inner_crop=0.6, min_contour_area=800, morph_kernel=(5,5))
+        detections = detect_colored_regions(
+            cv_image,
+            min_fill_ratio=0.55,
+            inner_crop=0.6,
+            min_contour_area=800,
+            morph_kernel=(5, 5),
+        )
 
         self.candidates_in_image = []
         for det in detections:
@@ -187,9 +223,16 @@ class BarrelDetector(Node):
 
             self.candidates_in_image.append((cx, cy, color, orientation))
 
-            cv2.rectangle(cv_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
-            cv2.putText(cv_image, f"{color} {orientation}",
-                        (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            cv2.rectangle(cv_image, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            cv2.putText(
+                cv_image,
+                f"{color} {orientation}",
+                (x, y - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 0),
+                2,
+            )
 
         cv2.imshow("Barrels", cv_image)
         cv2.waitKey(1)
@@ -216,14 +259,15 @@ class BarrelDetector(Node):
 
             p_cam = PointStamped()
             p_cam.header.frame_id = "oakd_rgb_camera_optical_frame"
-            p_cam.header.stamp = data.header.stamp
+            # p_cam.header.stamp = data.header.stamp
+            p_cam.header.stamp = Time().to_msg()
             p_cam.point.x = float(d[0])
             p_cam.point.y = float(d[1])
             p_cam.point.z = float(d[2])
 
             try:
                 p_map = self.tf_buffer.transform(
-                    p_cam, "map", timeout=rclpy.duration.Duration(seconds=0.1)
+                    p_cam, "map", timeout=rclpy.duration.Duration(seconds=0.5)
                 )
             except Exception as e:
                 self.get_logger().warn(f"TF transform failed: {e}")
@@ -231,16 +275,18 @@ class BarrelDetector(Node):
 
             pose = PoseStamped()
             pose.header.frame_id = f"{color}:{orientation}"
-            pose.header.stamp = self.get_clock().now().to_msg()
+            # pose.header.stamp = self.get_clock().now().to_msg()
+            pose.header.stamp = Time().to_msg()
             pose.pose.position.x = p_map.point.x
             pose.pose.position.y = p_map.point.y
             pose.pose.position.z = p_map.point.z
             self.barrel_pub.publish(pose)
 
-            self.get_logger().info(
-                f"Barrel: {color} {orientation} at "
-                f"({p_map.point.x:.2f}, {p_map.point.y:.2f})"
-            )
+            self.get_logger().info(f"Barrel: {color} {orientation} at ({p_map.point})")
+
+    def _amclPoseCallback(self, msg):
+        self.current_pose = msg.pose
+
 
 def main():
     rclpy.init()
@@ -249,6 +295,7 @@ def main():
     cv2.destroyAllWindows()
     node.destroy_node()
     rclpy.shutdown()
+
 
 if __name__ == "__main__":
     main()

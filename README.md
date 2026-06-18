@@ -27,3 +27,4 @@ Should do:
 # installation
 
 ``` pip install insightface onnxruntime numpy opencv-python ```
+``` pip install fpdf ```

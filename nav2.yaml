@@ -43,17 +43,17 @@ controller_server:
       time_steps: 56
       model_dt: 0.05
       batch_size: 2000
-      ax_max: 3.0
-      ax_min: -3.0
+      ax_max: 4.0
+      ax_min: -4.0
+      az_max: 5.0
       ay_max: 3.0
-      az_max: 3.5
       vx_std: 0.2
       vy_std: 0.2
       wz_std: 0.4
-      vx_max: 0.5
-      vx_min: -0.35
+      vx_max: 1.0
+      vx_min: -0.5
+      wz_max: 2.5
       vy_max: 0.5
-      wz_max: 1.9
       iteration_count: 1
       prune_distance: 1.7
       transform_tolerance: 0.1
@@ -290,10 +290,10 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [0.26, 0.0, 1.0]
-    min_velocity: [-0.26, 0.0, -1.0]
-    max_accel: [2.5, 0.0, 3.2]
-    max_decel: [-2.5, 0.0, -3.2]
+    max_velocity: [0.8, 0.0, 2.0]
+    min_velocity: [-0.8, 0.0, -2.0]
+    max_accel: [3.0, 0.0, 4.0]
+    max_decel: [-3.0, 0.0, -4.0]
     odom_topic: "odom"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
