@@ -88,10 +88,33 @@ class LineDetector:
         cx = int(center[0])
         cy = int(center[1]) + int(h * 0.75)
 
+        #dodatek za junction detection, samo pogleda piksle pa ce so poti levo, naravnost...
+        bottom = mask[-40:, :]
+        third = bottom.shape[1] // 3
+
+        left_pixels = cv2.countNonZero(
+            bottom[:, :third]
+        )
+
+        center_pixels = cv2.countNonZero(
+            bottom[:, third:2*third]
+        )
+
+        right_pixels = cv2.countNonZero(
+            bottom[:, 2*third:]
+        )
+
+        left_exists = left_pixels > 200
+        center_exists = center_pixels > 200
+        right_exists = right_pixels > 200
+
         return (
             True,
             cx,
             cy,
             angle,
-            mask
+            mask,
+            left_exists,
+            center_exists,
+            right_exists
         )
