@@ -93,7 +93,7 @@ def parse_instruction(text):
 
 class RobotCommander(Node):
     MAX_GREET_ATTEMPTS = 2
-    FACE_STANDOFF = 0.5
+    FACE_STANDOFF = 0.4
     USE_WAYPOINT_ORIENTATION = True
     BELT_SPEED = 0.15
     BELT_EXIT_SECS = 1.5  # how long to drive forward after the final turn
@@ -291,71 +291,7 @@ class RobotCommander(Node):
             Task.INSPECT_BELT: True,
             Task.FOLLOW_BLUE: True,
         }
-        self.report_entries = [
-            {
-                "task_name": "Find Rings",
-                "face": {
-                    "name": "Ana Novak",
-                    "job": "Engineer",
-                    "pronouns": "she/her",
-                    "image_bytes": None,
-                },
-                "items": [
-                    {"type": "note", "text": "Total rings found: 2"},
-                    {
-                        "type": "ring",
-                        "color": "red",
-                        "pos": np.array([1.23, -2.45]),
-                        "image_bytes": None,
-                    },
-                    {
-                        "type": "ring",
-                        "color": "blue",
-                        "pos": np.array([3.10, 0.87]),
-                        "image_bytes": None,
-                    },
-                ],
-            },
-            {
-                "task_name": "Find Barrels",
-                "face": {
-                    "name": "Marko Horvat",
-                    "job": "CTO",
-                    "pronouns": "he/him",
-                    "image_bytes": None,
-                },
-                "items": [
-                    {"type": "note", "text": "Total barrels found: 2"},
-                    {
-                        "type": "barrel",
-                        "color": "green",
-                        "orientation": "standing",
-                        "pos": np.array([-1.50, 2.30]),
-                        "image_bytes": None,
-                    },
-                    {
-                        "type": "barrel",
-                        "color": "red",
-                        "orientation": "tipped",
-                        "pos": np.array([0.75, -1.10]),
-                        "image_bytes": None,
-                    },
-                ],
-            },
-            {
-                "task_name": "Inspect Green Belt",
-                "face": {
-                    "name": "Petra Kos",
-                    "job": "QA Manager",
-                    "pronouns": "she/her",
-                    "image_bytes": None,
-                },
-                "items": [
-                    {"type": "note", "text": "Anomalies found: 1"},
-                    {"type": "anomaly", "image_bytes": None},
-                ],
-            },
-        ]
+
         self.info("Robot commander initialized")
 
         pdf_bytes = self.generate_report()
@@ -449,11 +385,11 @@ class RobotCommander(Node):
                     self.info("no jobs left; mission idle")
                     self._mission_done_logged = True
                 return
-            self.info(f"got a new job {self.current_job}")
+            self.info(f"got a new job {self.current_job['type']}")
             self._mission_done_logged = False
             start = self.JOB_START.get(self.current_job["type"])
             if start is not None:
-                self.info(f"start job {self.current_job}")
+                self.info(f"start job {self.current_job['type']}")
                 start(self.current_job)
             return
 
@@ -519,6 +455,9 @@ class RobotCommander(Node):
         if len(self.patrol_waypoints) == 0:
             return True
         return self._patrol_i >= len(self.patrol_waypoints)
+
+    def exploration_really_done(self):
+        return self._patrol_i > len(self.patrol_waypoints)
 
     def enqueue(self, job):
         self.job_queue.append(job)
@@ -587,43 +526,53 @@ class RobotCommander(Node):
             face["attempts"] += 1
             self.warn(f"could not reach face (attempt {face['attempts']})")
 
-    # read qr code, get the next instruction, resopond and start the task
     def done_converse(self, job, result):
         face = job["face"]
         face["greeted"] = True
-        gender = "woman" if face["pronouns"] in ("she/her") else "man"
+        is_woman = face["pronouns"] in ("she/her",)
+        gender = "woman" if is_woman else "man"
         self.say(f"Hello {face['name']} {gender}, the {face['job']}.")
 
-        qr = self.read_qr()
-        stepped_in = 0
-        step = 0.15  # metres per nudge
-        max_steps = 4
+        self.say("What would you like me to do?")
+        task, is_visitor = self._get_instruction()
 
-        while not qr and stepped_in < max_steps:
-            self._drive(0.15, 0.0)
-            time.sleep(0.5)
-            self._stop()
-            time.sleep(0.2)
-            rclpy.spin_once(self, timeout_sec=0.1)
-            qr = self.read_qr()
-            stepped_in += 1
+        # woman: keep confirming until she says ok/yes; "no. <new>" replaces the task
+        if is_woman:
+            while True:
+                if is_visitor:
+                    break
+                if task is None:
+                    self.say(
+                        "I couldn't understand that. What would you like me to do?"
+                    )
+                    task, is_visitor = self._get_instruction()
+                    continue
 
-        if stepped_in > 0:
-            self._drive(-0.15, 0.0)
-            time.sleep(step * stepped_in / 0.15)
-            self._stop()
+                self.say(f"Are you sure you want me to {self._task_phrase(task)}?")
+                reply = input("> ").strip().lower()
 
-        task, is_visitor = parse_instruction(qr)
+                if reply in ("ok", "yes"):
+                    break
+                # treat anything else as a new instruction (handles "no. find rings")
+                new_task, new_visitor = parse_instruction(reply)
+                if new_task is not None or new_visitor:
+                    task, is_visitor = new_task, new_visitor
+                # if reply had no parseable instruction, loop reasks "are you sure" on same task
+
         if is_visitor:
             self.say("Hope you have a nice time")
             return
         if task is None:
             self.say("couldn't understand instruction")
-            self.warn("invalid qr")
+            self.warn("invalid instruction")
             return
         self.say(f"OK. I will {self._task_phrase(task)}.")
         task["face"] = face
         self.enqueue(task)
+
+    def _get_instruction(self):
+        text = input("> ").strip()
+        return parse_instruction(text)
 
     # navigate to a single point, optional yaw, used for rings / barrels / belt spot
     def start_goto_point(self, job):
@@ -692,16 +641,16 @@ class RobotCommander(Node):
             self.detected_rings,
             key=lambda r: np.linalg.norm(r["pos"] - robot) if robot is not None else 0,
         )
-        for i, ring in enumerate(objects):
-            nav_pos = self._pos_toward_robot(ring["pos"])
-            self.enqueue(
-                {
-                    "type": Task.GOTO_POINT,
-                    "pos": nav_pos,
-                    "yaw": None,
-                    "label": f"ring {i} ({ring['color']})",
-                }
-            )
+        # for i, ring in enumerate(objects):
+        #     nav_pos = self._pos_toward_robot(ring["pos"])
+        #     self.enqueue(
+        #         {
+        #             "type": Task.GOTO_POINT,
+        #             "pos": nav_pos,
+        #             "yaw": None,
+        #             "label": f"ring {i} ({ring['color']})",
+        #         }
+        #     )
 
     def start_find_barrels(self, job):
         robot = (
@@ -719,16 +668,16 @@ class RobotCommander(Node):
             self.detected_barrels,
             key=lambda b: np.linalg.norm(b["pos"] - robot) if robot is not None else 0,
         )
-        for i, barrel in enumerate(objects):
-            nav_pos = self._pos_toward_robot(barrel["pos"])
-            self.enqueue(
-                {
-                    "type": Task.GOTO_POINT,
-                    "pos": nav_pos,
-                    "yaw": None,
-                    "label": f"barrel {i} ({barrel['color']})",
-                }
-            )
+        # for i, barrel in enumerate(objects):
+        #     nav_pos = self._pos_toward_robot(barrel["pos"])
+        #     self.enqueue(
+        #         {
+        #             "type": Task.GOTO_POINT,
+        #             "pos": nav_pos,
+        #             "yaw": None,
+        #             "label": f"barrel {i} ({barrel['color']})",
+        #         }
+        #     )
 
     def done_find_rings(self, job, result):
         self.report_start_task("Find Rings", face=job.get("face"))
@@ -849,9 +798,9 @@ class RobotCommander(Node):
             return False
 
         if phase == "nudge":
+            self._belt_check_anomaly(job)
             if time.time() - job["nudge_start"] >= 1.0:
                 self._stop()
-                self._belt_check_anomaly(job)
                 job["phase"] = "final_turn"
                 job["turn_start_yaw"] = self._current_yaw()
                 return False
@@ -939,7 +888,9 @@ class RobotCommander(Node):
         if job["phase"] != "follow":
             return False
 
-        cto = next((f for f in self.detected_faces if "cto" in f["job"].lower()), None)
+        cto = next(
+            (f for f in self.detected_faces if f["job"].strip().lower() == "cto"), None
+        )
 
         if cto is not None:
             self._stop()
@@ -999,7 +950,8 @@ class RobotCommander(Node):
                 self.say(qr)
 
             cto = next(
-                (f for f in self.detected_faces if "cto" in f["job"].lower()), None
+                (f for f in self.detected_faces if f["job"].strip().lower() == "cto"),
+                None,
             )
 
             if cto is not None:
@@ -1384,7 +1336,7 @@ class RobotCommander(Node):
         return cv2.imencode(".jpg", self.latest_front_image)[1].tobytes()
 
     def _ringCallback(self, msg):
-        if self.exploration_done() or self.first_room_done:
+        if self.exploration_really_done() or self.first_room_done:
             return
         pos = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
         rec = self._update_candidate(
@@ -1401,7 +1353,7 @@ class RobotCommander(Node):
             self.info(f"CONFIRMED ring: {rec['color']}")
 
     def _barrelCallback(self, msg):
-        if self.exploration_done() or self.first_room_done:
+        if self.exploration_really_done() or self.first_room_done:
             return
         try:
             color, orientation = msg.header.frame_id.split(":")
@@ -1461,6 +1413,15 @@ class RobotCommander(Node):
             m.pose.position.y = float(face["pos"][1])
             self.face_marker_pub.publish(m)
 
+            self._publish_text_marker(
+                self.face_marker_pub,
+                f"{face.get('name', '?')} ({face.get('job', '?')})",
+                float(face["pos"][0]),
+                float(face["pos"][1]),
+                0.5,
+                marker_id=1000 + i,
+            )
+
         for i, ring in enumerate(self.detected_rings):
             m = Marker()
             m.header.frame_id = "map"
@@ -1475,6 +1436,15 @@ class RobotCommander(Node):
             m.pose.position.y = float(ring["pos"][1])
             m.pose.position.z = float(ring["pos"][2])
             self.ring_marker_pub.publish(m)
+
+            self._publish_text_marker(
+                self.ring_marker_pub,
+                f"{ring['color']} ring",
+                float(ring["pos"][0]),
+                float(ring["pos"][1]),
+                float(ring["pos"][2]) + 0.3,
+                marker_id=1000 + i,
+            )
 
         for i, barrel in enumerate(self.detected_barrels):
             m = Marker()
@@ -1492,6 +1462,31 @@ class RobotCommander(Node):
             m.pose.position.y = float(barrel["pos"][1])
             m.pose.position.z = 0.3
             self.barrel_marker_pub.publish(m)
+
+            self._publish_text_marker(
+                self.barrel_marker_pub,
+                f"{barrel['color']} {barrel['orientation']}",
+                float(barrel["pos"][0]),
+                float(barrel["pos"][1]),
+                0.8,
+                marker_id=1000 + i,
+            )
+
+    def _publish_text_marker(self, pub, text, x, y, z, marker_id):
+        m = Marker()
+        m.header.frame_id = "map"
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.type = Marker.TEXT_VIEW_FACING
+        m.action = Marker.ADD
+        m.id = marker_id
+        m.scale.z = 0.2  # text height in metres
+        m.color.r = m.color.g = m.color.b = 1.0
+        m.color.a = 1.0
+        m.text = text
+        m.pose.position.x = x
+        m.pose.position.y = y
+        m.pose.position.z = z
+        pub.publish(m)
 
     def _frontCloudCallback(self, msg):
         cloud = pc2.read_points_numpy(msg, field_names=("x", "y", "z"))
