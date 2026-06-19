@@ -213,18 +213,13 @@ class BarrelDetector(Node):
         )
 
         for det in detections:
-
             fill = det["fill_ratio"]
             x, y, w, h = det["bbox"]
 
             aspect = w / float(h)
 
-            det["spill"] = (
-                det["orientation"] == "horizontal"
-                and (
-                    fill < 0.72
-                    or aspect > 2.8
-                )
+            det["spill"] = det["orientation"] == "horizontal" and (
+                fill < 0.72 or aspect > 2.8
             )
 
         candidates = []
@@ -236,7 +231,7 @@ class BarrelDetector(Node):
             orientation = det["orientation"]
             spill = det["spill"]
 
-            candidates.append((cx, cy, color, orientation))
+            candidates.append((cx, cy, color, orientation, spill))
 
             cv2.rectangle(cv_image, (x, y), (x + w, y + h), (0, 255, 0), 2)
             cv2.putText(
@@ -284,7 +279,7 @@ class BarrelDetector(Node):
         points = pc2.read_points_numpy(data, field_names=("x", "y", "z"))
         points = points.reshape((h, w, 3))
 
-        for cx, cy, color, orientation in candidates:
+        for cx, cy, color, orientation, spill in candidates:
             if not (0 <= cy < h and 0 <= cx < w):
                 continue
 
@@ -312,7 +307,7 @@ class BarrelDetector(Node):
                 continue
 
             pose = PoseStamped()
-            pose.header.frame_id = f"{color}:{orientation}"
+            pose.header.frame_id = f"{color}:{orientation}:{spill}"
             # FIX: real stamp instead of zero time
             pose.header.stamp = self.get_clock().now().to_msg()
             pose.pose.position.x = p_map.point.x

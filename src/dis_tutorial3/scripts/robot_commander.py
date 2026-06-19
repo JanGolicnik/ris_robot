@@ -86,7 +86,7 @@ def parse_instruction(text):
         task = {"type": Task.FIND_RINGS}
     elif "barrel" in t:
         task = {"type": Task.FIND_BARRELS}
-    elif "visitor" in t:
+    elif "visitor" in t or "nothing" in t:
         is_visitor = True
     return task, is_visitor
 
@@ -119,6 +119,8 @@ class RobotCommander(Node):
 
     def __init__(self):
         super().__init__("robot_commander")
+
+        self.should_quit = False
 
         self.report_entries = []
         self._current_entry = None
@@ -344,7 +346,7 @@ class RobotCommander(Node):
         return wps
 
     def main_loop(self):
-        while rclpy.ok():
+        while rclpy.ok() and not self.should_quit:
             rclpy.spin_once(self, timeout_sec=0.1)
             self.tick()
             # only accumulate belt-line points while we are still patrolling
@@ -408,7 +410,7 @@ class RobotCommander(Node):
         self.current_job = None
         done = self.JOB_DONE.get(job["type"])
         if done is not None:
-            self.info(f"done job {job}")
+            self.info(f"done job {job['type']}")
             done(job, self.getResult())
 
     def next_person(self):
@@ -464,7 +466,7 @@ class RobotCommander(Node):
 
     def get_belt_start(self, color):
         if color == "green":
-            start = np.array([0.35, -4.29])
+            start = np.array([0.25, -4.29])
             yaw = math.pi * 1.55
         elif color == "red":
             start = np.array([-4.22, -2.72])
@@ -551,7 +553,7 @@ class RobotCommander(Node):
                 self.say(f"Are you sure you want me to {self._task_phrase(task)}?")
                 reply = input("> ").strip().lower()
 
-                if reply in ("ok", "yes"):
+                if reply in ("ok", "yes", "yea", "sure"):
                     break
                 # treat anything else as a new instruction (handles "no. find rings")
                 new_task, new_visitor = parse_instruction(reply)
@@ -680,9 +682,11 @@ class RobotCommander(Node):
         #     )
 
     def done_find_rings(self, job, result):
+        print("RINGER")
         self.report_start_task("Find Rings", face=job.get("face"))
         self.report_add_note(f"Total rings found: {len(self.detected_rings)}")
         for ring in self.detected_rings:
+            print("ring")
             self.report_add(
                 type="ring",
                 color=ring["color"],
@@ -692,13 +696,16 @@ class RobotCommander(Node):
         self.say(f"Found {len(self.detected_rings)} rings.")
 
     def done_find_barrels(self, job, result):
+        print("BARRELER")
         self.report_start_task("Find Barrels", face=job.get("face"))
         self.report_add_note(f"Total barrels found: {len(self.detected_barrels)}")
         for barrel in self.detected_barrels:
+            print("barrel")
             self.report_add(
                 type="barrel",
                 color=barrel["color"],
                 orientation=barrel["orientation"],
+                spill=barrel["spill"],
                 pos=barrel["pos"],
                 image_bytes=barrel.get("image_bytes"),
             )
@@ -900,13 +907,10 @@ class RobotCommander(Node):
             self.info("CTO found")
 
             pdf_bytes = self.generate_report()
-            report_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "report.pdf"
-            )
-            with open(report_path, "wb") as f:
+            with open("report.pdf", "wb") as f:
                 f.write(pdf_bytes)
-            self.info(f"report written to {report_path}")
 
+            self.should_quit = True
             return True
 
         img = self.latest_top_image
@@ -936,7 +940,7 @@ class RobotCommander(Node):
 
         blue_pixels = 0 if mask is None else cv2.countNonZero(mask)
 
-        print(f"blue pixels: {blue_pixels}")
+        # print(f"blue pixels: {blue_pixels}")
 
         if found and blue_pixels < 1200:
             self._stop()
@@ -1356,7 +1360,7 @@ class RobotCommander(Node):
         if self.exploration_really_done() or self.first_room_done:
             return
         try:
-            color, orientation = msg.header.frame_id.split(":")
+            color, orientation, spill = msg.header.frame_id.split(":")
         except ValueError:
             return
         pos = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
@@ -1364,7 +1368,7 @@ class RobotCommander(Node):
             self.detected_barrel_candidates,
             self.detected_barrels,
             pos,
-            {"color": color, "orientation": orientation},
+            {"color": color, "orientation": orientation, "spill": spill},
             merge_dist=0.5,
         )
         if rec is not None:
@@ -1399,6 +1403,11 @@ class RobotCommander(Node):
         self.goal_marker_pub.publish(m)
 
     def publish_detection_markers(self):
+        import re
+
+        def clean(text):
+            return re.sub(r"\s+", " ", str(text)).strip()
+
         for i, face in enumerate(self.detected_faces):
             m = Marker()
             m.header.frame_id = "map"
@@ -1415,7 +1424,7 @@ class RobotCommander(Node):
 
             self._publish_text_marker(
                 self.face_marker_pub,
-                f"{face.get('name', '?')} ({face.get('job', '?')})",
+                f"{clean(face.get('name', '?'))} ({clean(face.get('job', '?'))})",
                 float(face["pos"][0]),
                 float(face["pos"][1]),
                 0.5,
@@ -1439,7 +1448,7 @@ class RobotCommander(Node):
 
             self._publish_text_marker(
                 self.ring_marker_pub,
-                f"{ring['color']} ring",
+                f"{clean(ring['color'])} ring",
                 float(ring["pos"][0]),
                 float(ring["pos"][1]),
                 float(ring["pos"][2]) + 0.3,
@@ -1465,7 +1474,7 @@ class RobotCommander(Node):
 
             self._publish_text_marker(
                 self.barrel_marker_pub,
-                f"{barrel['color']} {barrel['orientation']}",
+                f"{clean(barrel['color'])} {clean(barrel['orientation'])}",
                 float(barrel["pos"][0]),
                 float(barrel["pos"][1]),
                 0.8,
@@ -1480,7 +1489,7 @@ class RobotCommander(Node):
         m.action = Marker.ADD
         m.id = marker_id
         m.scale.z = 0.2  # text height in metres
-        m.color.r = m.color.g = m.color.b = 1.0
+        m.color.r = m.color.g = m.color.b = 0.0
         m.color.a = 1.0
         m.text = text
         m.pose.position.x = x
@@ -1637,7 +1646,7 @@ class RobotCommander(Node):
                         0,
                         7,
                         s(
-                            f"Barrel - color: {item.get('color', '?')}, orientation: {item.get('orientation', '?')}"
+                            f"Barrel - color: {item.get('color', '?')}, orientation: {item.get('orientation', '?')}, spill: {item.get('spill', '?')}"
                         ),
                         ln=True,
                     )
