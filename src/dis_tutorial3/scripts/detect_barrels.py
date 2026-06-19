@@ -227,7 +227,6 @@ class BarrelDetector(Node):
                 )
             )
 
-
         candidates = []
         for det in detections:
             x, y, w, h = det["bbox"]

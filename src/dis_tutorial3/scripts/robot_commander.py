@@ -163,6 +163,9 @@ class RobotCommander(Node):
         self.blue_line_start = (2.75, -0.35)
         self.line_error = 0.0
 
+        self.avoiding_yellow = False
+        self.yellow_ignore_until = 0.0
+
         self.bridge = CvBridge()
         self.latest_top_image = None
         self.latest_front_image = None
@@ -339,6 +342,32 @@ class RobotCommander(Node):
     # checks if it needs a new job, othewise runs the jobs update() and its done() if its finished
     def tick(self):
         cv2.waitKey(1)
+
+        if self.yellow_danger() and not self.avoiding_yellow:
+
+            self.info("YELLOW LINE DETECTED")
+
+            self.avoiding_yellow = True
+            self._stop()
+
+            self._drive(-0.5, 0.0)
+            time.sleep(1.0)
+            self._stop()
+
+            self.spin(math.pi / 2)
+
+            return
+        
+        if self.avoiding_yellow:
+
+            if not self.isTaskComplete():
+                return
+
+            self.avoiding_yellow = False
+            self.yellow_ignore_until = time.time() + 3.0
+
+            return
+
         if self.current_job is None:
             self.current_job = self.next_job()
             if self.current_job is None:
@@ -437,6 +466,7 @@ class RobotCommander(Node):
 
     # set the next waypoint to visit
     def start_explore(self, job):
+        self.set_arm("manual:[0.,0.4,1.9,0.9]")
         wp = self.patrol_waypoints[self._patrol_i]
         self._patrol_i += 1
         pos = np.array([wp["x"], wp["y"], 0.0])
@@ -887,6 +917,30 @@ class RobotCommander(Node):
         self.say(
             f"I found the CTO. I detected {len(self.detected_rings)} rings and {len(self.detected_barrels)} barrels."
         )
+
+    def yellow_danger(self):
+
+        if time.time() < self.yellow_ignore_until:
+            return False
+
+        if self.latest_top_image is None:
+            return False
+
+        found, cx, cy, _, mask, *_ = self.line_detector.find_line(
+            self.latest_top_image,
+            "yellow"
+        )
+
+        if not found:
+            return False
+
+        h = self.latest_top_image.shape[0]
+
+        pixels = cv2.countNonZero(mask)
+
+        print("yellow", pixels, cy)
+
+        return pixels > 4000
 
     def _drive(self, vx, wz):
         msg = TwistStamped()
