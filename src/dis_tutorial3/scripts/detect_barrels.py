@@ -212,6 +212,22 @@ class BarrelDetector(Node):
             morph_kernel=(5, 5),
         )
 
+        for det in detections:
+
+            fill = det["fill_ratio"]
+            x, y, w, h = det["bbox"]
+
+            aspect = w / float(h)
+
+            det["spill"] = (
+                det["orientation"] == "horizontal"
+                and (
+                    fill < 0.72
+                    or aspect > 2.8
+                )
+            )
+
+
         candidates = []
         for det in detections:
             x, y, w, h = det["bbox"]
@@ -219,13 +235,14 @@ class BarrelDetector(Node):
             cy = y + h // 2
             color = det["color"]
             orientation = det["orientation"]
+            spill = det["spill"]
 
             candidates.append((cx, cy, color, orientation))
 
             cv2.rectangle(cv_image, (x, y), (x + w, y + h), (0, 255, 0), 2)
             cv2.putText(
                 cv_image,
-                f"{color} {orientation}",
+                f"{color} {orientation} {'SPILL' if spill else ''}",
                 (x, y - 5),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
