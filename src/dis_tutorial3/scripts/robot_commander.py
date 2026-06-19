@@ -99,7 +99,7 @@ class RobotCommander(Node):
     BELT_EXIT_SECS = 1.5  # how long to drive forward after the final turn
     BELT_STEER_GAIN = 0.003
     BELT_LOST_LIMIT = 15
-    ANOMALY_COOLDOWN = 1.0
+    ANOMALY_COOLDOWN = 1.5
 
     BELT_LANE_OFFSET = 0.0
     BELT_SIDE = 1
@@ -459,7 +459,7 @@ class RobotCommander(Node):
         return self._patrol_i >= len(self.patrol_waypoints)
 
     def exploration_really_done(self):
-        return self._patrol_i > len(self.patrol_waypoints)
+        return self._patrol_i >= len(self.patrol_waypoints)
 
     def enqueue(self, job):
         self.job_queue.append(job)
@@ -643,16 +643,16 @@ class RobotCommander(Node):
             self.detected_rings,
             key=lambda r: np.linalg.norm(r["pos"] - robot) if robot is not None else 0,
         )
-        for i, ring in enumerate(objects):
-            nav_pos = self._pos_toward_robot(ring["pos"])
-            self.enqueue(
-                {
-                    "type": Task.GOTO_POINT,
-                    "pos": nav_pos,
-                    "yaw": None,
-                    "label": f"ring {i} ({ring['color']})",
-                }
-            )
+        # for i, ring in enumerate(objects):
+        #     nav_pos = self._pos_toward_robot(ring["pos"])
+        #     self.enqueue(
+        #         {
+        #             "type": Task.GOTO_POINT,
+        #             "pos": nav_pos,
+        #             "yaw": None,
+        #             "label": f"ring {i} ({ring['color']})",
+        #         }
+        #     )
 
     def start_find_barrels(self, job):
         robot = (
@@ -682,25 +682,24 @@ class RobotCommander(Node):
         #     )
 
     def done_find_rings(self, job, result):
-        print("RINGER")
         self.report_start_task("Find Rings", face=job.get("face"))
         self.report_add_note(f"Total rings found: {len(self.detected_rings)}")
-        for ring in self.detected_rings:
-            print("ring")
+        for i, ring in enumerate(self.detected_rings):
             self.report_add(
                 type="ring",
                 color=ring["color"],
                 pos=ring["pos"],
                 image_bytes=ring.get("image_bytes"),
             )
+            self.say(f"ring {i} is {ring["color"]}")
+
         self.say(f"Found {len(self.detected_rings)} rings.")
 
     def done_find_barrels(self, job, result):
-        print("BARRELER")
         self.report_start_task("Find Barrels", face=job.get("face"))
         self.report_add_note(f"Total barrels found: {len(self.detected_barrels)}")
-        for barrel in self.detected_barrels:
-            print("barrel")
+        self.say(f"found {len(self.detected_barrels)} barrels.")
+        for i, barrel in enumerate(self.detected_barrels):
             self.report_add(
                 type="barrel",
                 color=barrel["color"],
@@ -709,7 +708,9 @@ class RobotCommander(Node):
                 pos=barrel["pos"],
                 image_bytes=barrel.get("image_bytes"),
             )
-        self.say(f"found {len(self.detected_barrels)} barrels.")
+            if barrel["spill"]:
+                self.say(f"barrel {i} {barrel["orientation"]} {barrel["color"]} was spilled")
+
 
     # fit the belt line from the patrol points, drive to its near end, then along it
     def start_inspect_belt(self, job):
