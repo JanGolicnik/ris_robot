@@ -119,7 +119,7 @@ def detect_colored_regions(
 
             orientation = (
                 "vertical"
-                if h > 1.3 * w
+                if h > 1.5 * w
                 else ("horizontal" if w > 1.25 * h else "unknown")
             )
             if cname == "black" and orientation == "horizontal":

@@ -38,7 +38,7 @@ ARGUMENTS = [
     ),
     DeclareLaunchArgument(
         "params_file",
-        default_value="/home/jan/Faks/drugi_letnik/drugi_semester/ris/workspace2/ris_robot/nav2.yaml",
+        default_value="/home/rho/ris_robot/nav2.yaml",
         description="Nav2 parameters",
     ),
     DeclareLaunchArgument("namespace", default_value="", description="Robot namespace"),

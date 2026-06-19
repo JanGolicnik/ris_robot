@@ -643,16 +643,16 @@ class RobotCommander(Node):
             self.detected_rings,
             key=lambda r: np.linalg.norm(r["pos"] - robot) if robot is not None else 0,
         )
-        # for i, ring in enumerate(objects):
-        #     nav_pos = self._pos_toward_robot(ring["pos"])
-        #     self.enqueue(
-        #         {
-        #             "type": Task.GOTO_POINT,
-        #             "pos": nav_pos,
-        #             "yaw": None,
-        #             "label": f"ring {i} ({ring['color']})",
-        #         }
-        #     )
+        for i, ring in enumerate(objects):
+            nav_pos = self._pos_toward_robot(ring["pos"])
+            self.enqueue(
+                {
+                    "type": Task.GOTO_POINT,
+                    "pos": nav_pos,
+                    "yaw": None,
+                    "label": f"ring {i} ({ring['color']})",
+                }
+            )
 
     def start_find_barrels(self, job):
         robot = (
