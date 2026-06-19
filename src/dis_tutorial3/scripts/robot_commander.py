@@ -115,7 +115,7 @@ class RobotCommander(Node):
     BELT_STRAIGHT_SECS_RED = 17.0
     BELT_COLOR_LOST_FRAMES = 10
 
-    GOTO_POINT_STANDOFF = 2.0
+    GOTO_POINT_STANDOFF = 1.5
 
     def __init__(self):
         super().__init__("robot_commander")
@@ -291,8 +291,76 @@ class RobotCommander(Node):
             Task.INSPECT_BELT: True,
             Task.FOLLOW_BLUE: True,
         }
-
+        self.report_entries = [
+            {
+                "task_name": "Find Rings",
+                "face": {
+                    "name": "Ana Novak",
+                    "job": "Engineer",
+                    "pronouns": "she/her",
+                    "image_bytes": None,
+                },
+                "items": [
+                    {"type": "note", "text": "Total rings found: 2"},
+                    {
+                        "type": "ring",
+                        "color": "red",
+                        "pos": np.array([1.23, -2.45]),
+                        "image_bytes": None,
+                    },
+                    {
+                        "type": "ring",
+                        "color": "blue",
+                        "pos": np.array([3.10, 0.87]),
+                        "image_bytes": None,
+                    },
+                ],
+            },
+            {
+                "task_name": "Find Barrels",
+                "face": {
+                    "name": "Marko Horvat",
+                    "job": "CTO",
+                    "pronouns": "he/him",
+                    "image_bytes": None,
+                },
+                "items": [
+                    {"type": "note", "text": "Total barrels found: 2"},
+                    {
+                        "type": "barrel",
+                        "color": "green",
+                        "orientation": "standing",
+                        "pos": np.array([-1.50, 2.30]),
+                        "image_bytes": None,
+                    },
+                    {
+                        "type": "barrel",
+                        "color": "red",
+                        "orientation": "tipped",
+                        "pos": np.array([0.75, -1.10]),
+                        "image_bytes": None,
+                    },
+                ],
+            },
+            {
+                "task_name": "Inspect Green Belt",
+                "face": {
+                    "name": "Petra Kos",
+                    "job": "QA Manager",
+                    "pronouns": "she/her",
+                    "image_bytes": None,
+                },
+                "items": [
+                    {"type": "note", "text": "Anomalies found: 1"},
+                    {"type": "anomaly", "image_bytes": None},
+                ],
+            },
+        ]
         self.info("Robot commander initialized")
+
+        pdf_bytes = self.generate_report()
+        with open("report.pdf", "wb") as f:
+            f.write(pdf_bytes)
 
     def set_arm(self, command):
         msg = String()
@@ -442,7 +510,7 @@ class RobotCommander(Node):
             return {"type": Task.GOTO_FACE, "face": face}
         else:
             self.first_room_done = True
-        return {"type": Task.INSPECT_BELT, "color": "red"}
+        # return {"type": Task.INSPECT_BELT, "color": "red"}
         if not self.second_room_done:
             return {"type": Task.FOLLOW_BLUE}
         return None
@@ -583,6 +651,7 @@ class RobotCommander(Node):
     def done_goto_point(self, job, result):
         label = job.get("label", "point")
         if result == TaskResult.SUCCEEDED:
+            self.say(f"{label}")
             self.info(f"reached {label}")
         else:
             self.warn(f"could not reach {label}")
@@ -591,50 +660,71 @@ class RobotCommander(Node):
         if self.goal_handle is not None:
             self.goal_handle.cancel_goal_async()
 
-    # queue a visit to every ring found during the patrol
-    def start_find_rings(self, job):
+    def _pos_toward_robot(self, obj_pos, dist=1.0):
         if self.current_pose is None:
-            objects = self.detected_rings
-        else:
-            robot = np.array(
+            return obj_pos
+        robot = np.array(
+            [
+                self.current_pose.pose.position.x,
+                self.current_pose.pose.position.y,
+                0.0,
+            ]
+        )
+        direction = robot - obj_pos
+        norm = np.linalg.norm(direction)
+        if norm < 1e-6:
+            return obj_pos
+        return obj_pos + direction / norm * dist
+
+    def start_find_rings(self, job):
+        robot = (
+            np.array(
                 [
                     self.current_pose.pose.position.x,
                     self.current_pose.pose.position.y,
                     0.0,
                 ]
             )
-            objects = sorted(
-                self.detected_rings, key=lambda r: np.linalg.norm(r["pos"] - robot)
-            )
+            if self.current_pose
+            else None
+        )
+        objects = sorted(
+            self.detected_rings,
+            key=lambda r: np.linalg.norm(r["pos"] - robot) if robot is not None else 0,
+        )
         for i, ring in enumerate(objects):
+            nav_pos = self._pos_toward_robot(ring["pos"])
             self.enqueue(
                 {
                     "type": Task.GOTO_POINT,
-                    "pos": ring["pos"].copy(),
+                    "pos": nav_pos,
                     "yaw": None,
                     "label": f"ring {i} ({ring['color']})",
                 }
             )
 
     def start_find_barrels(self, job):
-        if self.current_pose is None:
-            objects = self.detected_barrels
-        else:
-            robot = np.array(
+        robot = (
+            np.array(
                 [
                     self.current_pose.pose.position.x,
                     self.current_pose.pose.position.y,
                     0.0,
                 ]
             )
-            objects = sorted(
-                self.detected_barrels, key=lambda b: np.linalg.norm(b["pos"] - robot)
-            )
+            if self.current_pose
+            else None
+        )
+        objects = sorted(
+            self.detected_barrels,
+            key=lambda b: np.linalg.norm(b["pos"] - robot) if robot is not None else 0,
+        )
         for i, barrel in enumerate(objects):
+            nav_pos = self._pos_toward_robot(barrel["pos"])
             self.enqueue(
                 {
                     "type": Task.GOTO_POINT,
-                    "pos": barrel["pos"].copy(),
+                    "pos": nav_pos,
                     "yaw": None,
                     "label": f"barrel {i} ({barrel['color']})",
                 }
@@ -1083,11 +1173,11 @@ class RobotCommander(Node):
         debug = img.copy()
         cv2.rectangle(debug, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-        cv2.imshow("cropped arm", debug)
+        # cv2.imshow("cropped arm", debug)
         # cv2.imshow("threshold", thresh)
         cv2.imshow("tile", vis)
-        cv2.imshow("mask", mask)
-        cv2.imshow("blackhat", blackhat)
+        # cv2.imshow("mask", mask)
+        # cv2.imshow("blackhat", blackhat)
 
         return bool(is_anomaly)
 
@@ -1294,7 +1384,7 @@ class RobotCommander(Node):
         return cv2.imencode(".jpg", self.latest_front_image)[1].tobytes()
 
     def _ringCallback(self, msg):
-        if self.first_room_done:
+        if self.exploration_done() or self.first_room_done:
             return
         pos = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
         rec = self._update_candidate(
@@ -1311,7 +1401,7 @@ class RobotCommander(Node):
             self.info(f"CONFIRMED ring: {rec['color']}")
 
     def _barrelCallback(self, msg):
-        if self.first_room_done:
+        if self.exploration_done() or self.first_room_done:
             return
         try:
             color, orientation = msg.header.frame_id.split(":")
@@ -1361,7 +1451,7 @@ class RobotCommander(Node):
             m = Marker()
             m.header.frame_id = "map"
             m.header.stamp = self.get_clock().now().to_msg()
-            m.type = Marker.SPHERE
+            m.type = Marker.CUBE
             m.action = Marker.ADD
             m.id = i
             m.scale.x = m.scale.y = m.scale.z = 0.3
@@ -1580,7 +1670,7 @@ class RobotCommander(Node):
 
             pdf.ln(6)
 
-        return bytes(pdf.output())
+        return pdf.output(dest="S").encode("latin-1")
 
 
 def main(args=None):

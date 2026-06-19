@@ -46,7 +46,7 @@ class AnomalyDetector:
 
         # debug visualizations
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        cv2.imshow("gray eq", clahe.apply(gray))
+        # cv2.imshow("gray eq", clahe.apply(gray))
 
         hough_vis = image.copy()
         if circles is not None:
@@ -63,7 +63,7 @@ class AnomalyDetector:
                 (0, 0, 255),
                 2,
             )
-        cv2.imshow("hough", hough_vis)
+        # cv2.imshow("hough", hough_vis)
 
         print(
             f"min={np.min(blackhat)} max={np.max(blackhat)} mean={np.mean(blackhat):.1f} "
