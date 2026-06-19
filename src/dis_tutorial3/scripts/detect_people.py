@@ -10,10 +10,16 @@ import rclpy
 import tf2_geometry_msgs
 import tf2_ros
 from cv_bridge import CvBridge, CvBridgeError
-from geometry_msgs.msg import PointStamped, PoseStamped
+from geometry_msgs.msg import PointStamped, PoseStamped, PoseWithCovarianceStamped
 from insightface.app import FaceAnalysis
 from rclpy.node import Node
-from rclpy.qos import QoSReliabilityPolicy, qos_profile_sensor_data
+from rclpy.qos import (
+    QoSDurabilityPolicy,
+    QoSHistoryPolicy,
+    QoSProfile,
+    QoSReliabilityPolicy,
+    qos_profile_sensor_data,
+)
 from rclpy.time import Time
 from sensor_msgs.msg import Image, PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
@@ -132,11 +138,15 @@ class detect_faces(Node):
         rgb_topic = gp("rgb_topic").get_parameter_value().string_value
         pc_topic = gp("pointcloud_topic").get_parameter_value().string_value
 
+        self.updated = False
+
         self.detection_color = (0, 0, 255)
         self.bridge = CvBridge()
         self.cv_image = None
         self.faces = []
         self.frame_i = 0
+
+        self.current_pose = None
 
         self.get_logger().info("Loading insightface (detection + recognition)...")
         self.app = load_face_app(self.device)
@@ -157,9 +167,23 @@ class detect_faces(Node):
         self.pointcloud_sub = self.create_subscription(
             PointCloud2, pc_topic, self.pointcloud_callback, qos_profile_sensor_data
         )
+        self.create_subscription(
+            PoseWithCovarianceStamped,
+            "amcl_pose",
+            self._amclPoseCallback,
+            QoSProfile(
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+            ),
+        )
         self.face_pub = self.create_publisher(FaceDetection, "/face_detections", 10)
+        # FIX: pass a proper QoSProfile, not a bare enum value
         self.face_pos_pub = self.create_publisher(
-            PoseStamped, "/face_positions", QoSReliabilityPolicy.BEST_EFFORT
+            PoseStamped,
+            "/face_positions",
+            QoSProfile(depth=10, reliability=QoSReliabilityPolicy.BEST_EFFORT),
         )
         self.face_img_pub = self.create_publisher(Image, "/face_image", 10)
 
@@ -206,53 +230,86 @@ class detect_faces(Node):
                 )
 
         self.faces = results
-
+        self.updated = True
         if self.show_window:
             cv2.imshow("faces", cv_image)
             if cv2.waitKey(1) == 27:  # Esc
                 rclpy.shutdown()
 
     def pointcloud_callback(self, data):
-        faces = self.faces
-        if not faces:
+        if self.current_pose is None:
             return
+        faces = self.faces
+        if not faces or not self.updated:
+            return
+        self.updated = False
 
         height, width = data.height, data.width
         cloud = pc2.read_points_numpy(data, field_names=("x", "y", "z"))
         cloud = cloud.reshape((height, width, 3))
 
-        for idx, face in enumerate(faces):
+        robot_pos = np.array(
+            [self.current_pose.pose.position.x, self.current_pose.pose.position.y, 0.0]
+        )
+
+        # camera origin in map frame; used to orient the face "normal" toward
+        # where it was seen from. Computed once per cloud, not per face.
+        cam_origin_map = self._to_map(np.array([0.0, 0.0, 0.0]))
+        cam_in_map = None
+        if cam_origin_map is not None:
+            cam_in_map = np.array(
+                [cam_origin_map.point.x, cam_origin_map.point.y, cam_origin_map.point.z]
+            )
+
+        for face in faces:
             cx, cy = face["center"]
             if not (0 <= cy < height and 0 <= cx < width):
                 continue
 
             d = cloud[cy, cx, :]
-            oy, ox = max(cy - 7, 0), max(cx - 7, 0)
-            d2 = cloud[oy, ox, :]
-
             if not np.isfinite(d).all() or np.linalg.norm(d) < 0.001:
                 continue
 
-            p1_map = self._to_map(d, data.header.stamp)
+            p1_map = self._to_map(d)
             if p1_map is None:
                 continue
             p1 = np.array([p1_map.point.x, p1_map.point.y, p1_map.point.z])
+            if np.linalg.norm(p1 - robot_pos) > 2.5:
+                print("face too far")
+                continue
 
-            normal = np.zeros(3)
-            if np.isfinite(d2).all():
-                p2_map = self._to_map(d2, data.header.stamp)
-                if p2_map is not None:
-                    p2 = np.array([p2_map.point.x, p2_map.point.y, p2_map.point.z])
-                    v = p1 - p2
-                    nv = np.linalg.norm(v)
-                    if nv > 1e-6:
-                        v /= nv
-                        normal = np.cross(np.array([0.0, 0.0, -1.0]), v) * 0.5
+            patch_size = 5  # pixels, tune if needed
 
+            samples = []
+            for du in range(-patch_size, patch_size + 1, 2):
+                for dv in range(-patch_size, patch_size + 1, 2):
+                    u = cx + du
+                    v = cy + dv
+                    if not (0 <= v < height and 0 <= u < width):
+                        continue
+                    s = cloud[v, u, :]
+                    if not np.isfinite(s).all() or np.linalg.norm(s) < 0.001:
+                        continue
+                    pm = self._to_map(s)
+                    if pm is None:
+                        continue
+                    samples.append([pm.point.x, pm.point.y, pm.point.z])
+
+            if len(samples) < 3:
+                normal = np.zeros(3)
+            else:
+                pts = np.array(samples)
+                center = pts.mean(axis=0)
+                _, _, vt = np.linalg.svd(pts - center, full_matrices=False)
+                normal = vt[2]  # smallest singular value = normal direction
+                normal[2] = 0.0
+                normal /= np.linalg.norm(normal) + 1e-9
+                # flip to face the camera
+                if cam_in_map is not None and np.dot(normal, cam_in_map - p1) < 0:
+                    normal = -normal
             self._publish_face(face["name"], p1, normal)
-            self._publish_face_crop(face, data.header.stamp)
 
-    def _to_map(self, xyz, stamp):
+    def _to_map(self, xyz):
         ps = PointStamped()
         ps.header.frame_id = CAMERA_FRAME
         ps.header.stamp = Time().to_msg()  # 0 -> "latest available", no extrapolation
@@ -274,38 +331,45 @@ class detect_faces(Node):
         qx, qy, qz, qw = yaw_to_quaternion(yaw)
         m = self.meta.get(name, {})
 
+        pose = PoseStamped()
+        pose.header.frame_id = "map"
+        pose.header.stamp = self.get_clock().now().to_msg()
+        pose.pose.position.x = float(p1[0])
+        pose.pose.position.y = float(p1[1])
+        pose.pose.position.z = float(p1[2])
+        pose.pose.orientation.x = qx
+        pose.pose.orientation.y = qy
+        pose.pose.orientation.z = qz
+        pose.pose.orientation.w = qw
+
         fd = FaceDetection()
         fd.name = name
         fd.pronouns = m.get("pronouns", "")
         fd.job = m.get("job", "")
-        fd.pose.header.frame_id = "map"
-        fd.pose.header.stamp = self.get_clock().now().to_msg()
-        fd.pose.pose.position.x = float(p1[0])
-        fd.pose.pose.position.y = float(p1[1])
-        fd.pose.pose.position.z = float(p1[2])
-        fd.pose.pose.orientation.x = qx
-        fd.pose.pose.orientation.y = qy
-        fd.pose.pose.orientation.z = qz
-        fd.pose.pose.orientation.w = qw
+        fd.pose = pose
         self.face_pub.publish(fd)
+        self.face_pos_pub.publish(pose)
 
-    def _publish_face_crop(self, face, stamp):
-        if self.cv_image is None:
-            return
-        x1, y1, x2, y2 = face["bbox"]
-        h, w = self.cv_image.shape[:2]
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-        if x2 <= x1 or y2 <= y1:
-            return
-        crop = self.cv_image[y1:y2, x1:x2]
-        try:
-            msg = self.bridge.cv2_to_imgmsg(crop, encoding="bgr8")
-            msg.header.stamp = stamp
-            msg.header.frame_id = CAMERA_FRAME
-            self.face_img_pub.publish(msg)
-        except Exception as e:
-            self.get_logger().warn(f"Face image publish failed: {e}")
+    # def _publish_face_crop(self, face, stamp):
+    #     if self.cv_image is None:
+    #         return
+    #     x1, y1, x2, y2 = face["bbox"]
+    #     h, w = self.cv_image.shape[:2]
+    #     x1, y1 = max(0, x1), max(0, y1)
+    #     x2, y2 = min(w, x2), min(h, y2)
+    #     if x2 <= x1 or y2 <= y1:
+    #         return
+    #     crop = self.cv_image[y1:y2, x1:x2]
+    #     try:
+    #         msg = self.bridge.cv2_to_imgmsg(crop, encoding="bgr8")
+    #         msg.header.stamp = stamp
+    #         msg.header.frame_id = CAMERA_FRAME
+    #         self.face_img_pub.publish(msg)
+    #     except Exception as e:
+    #         self.get_logger().warn(f"Face image publish failed: {e}")
+
+    def _amclPoseCallback(self, msg):
+        self.current_pose = msg.pose
 
 
 def main():

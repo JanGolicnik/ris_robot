@@ -8,7 +8,7 @@ import tf2_ros
 from cv_bridge import CvBridge
 from geometry_msgs.msg import (
     Point,
-    PointStamped,  # add to your geometry_msgs import
+    PointStamped,
     PoseStamped,
     PoseWithCovarianceStamped,
     Quaternion,
@@ -37,9 +37,6 @@ COLOR_RANGES = {
     "green": [(np.array([40, 50, 50]), np.array([90, 255, 255]))],
     "blue": [(np.array([95, 100, 80]), np.array([130, 255, 255]))],
     "yellow": [(np.array([18, 80, 80]), np.array([35, 255, 255]))],
-    # "purple": [(np.array([135, 50, 50]), np.array([165, 255, 255]))],
-    # "orange": [(np.array([9, 100, 50]), np.array([17, 255, 255]))],
-    # "brown": [(np.array([10, 80, 30]), np.array([20, 200, 150]))],
     "black": [(np.array([0, 0, 0]), np.array([180, 255, 50]))],
 }
 
@@ -68,8 +65,6 @@ def detect_colored_regions(
 
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        if cname == "black":
-            cv2.imshow("black mask", mask)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in contours:
@@ -156,12 +151,16 @@ def detect_colored_regions(
 
 
 class BarrelDetector(Node):
+    MAX_DEPTH = 4.0  # ignore detections farther than this (m)
+    CENTER_PATCH = 5  # half-size of the patch sampled around the bbox center
+
     def __init__(self):
         super().__init__("detect_barrels")
 
         self.bridge = CvBridge()
         self.cv_image = None
         self.candidates_in_image = []
+        self.current_pose = None  # FIX: initialize before any callback can read it
 
         self.image_sub = self.create_subscription(
             Image,
@@ -213,7 +212,7 @@ class BarrelDetector(Node):
             morph_kernel=(5, 5),
         )
 
-        self.candidates_in_image = []
+        candidates = []
         for det in detections:
             x, y, w, h = det["bbox"]
             cx = x + w // 2
@@ -221,7 +220,7 @@ class BarrelDetector(Node):
             color = det["color"]
             orientation = det["orientation"]
 
-            self.candidates_in_image.append((cx, cy, color, orientation))
+            candidates.append((cx, cy, color, orientation))
 
             cv2.rectangle(cv_image, (x, y), (x + w, y + h), (0, 255, 0), 2)
             cv2.putText(
@@ -234,33 +233,56 @@ class BarrelDetector(Node):
                 2,
             )
 
+        # FIX: publish the list atomically so the pointcloud callback never sees
+        # a half-built list (matters under a multithreaded executor).
+        self.candidates_in_image = candidates
+
         cv2.imshow("Barrels", cv_image)
         cv2.waitKey(1)
 
+    def _closest_point_in_patch(self, points, cx, cy, h, w):
+        # FIX: sample a small window around the center and take the closest valid
+        # point, rather than trusting a single center pixel that may hit the
+        # background through a gap.
+        r = self.CENTER_PATCH
+        y0, y1 = max(0, cy - r), min(h, cy + r + 1)
+        x0, x1 = max(0, cx - r), min(w, cx + r + 1)
+        patch = points[y0:y1, x0:x1].reshape(-1, 3)
+
+        finite = patch[np.isfinite(patch).all(axis=1)]
+        if finite.shape[0] == 0:
+            return None
+        norms = np.linalg.norm(finite, axis=1)
+        finite = finite[norms > 0.001]
+        norms = norms[norms > 0.001]
+        if finite.shape[0] == 0:
+            return None
+        return finite[int(np.argmin(norms))]
+
     def pointcloud_callback(self, data):
-        if not self.candidates_in_image:
+        candidates = self.candidates_in_image
+        if not candidates:
             return
 
         h, w = data.height, data.width
         points = pc2.read_points_numpy(data, field_names=("x", "y", "z"))
         points = points.reshape((h, w, 3))
 
-        for cx, cy, color, orientation in self.candidates_in_image:
+        for cx, cy, color, orientation in candidates:
             if not (0 <= cy < h and 0 <= cx < w):
                 continue
 
-            d = points[cy, cx]
-            if not np.isfinite(d).all() or np.linalg.norm(d) < 0.001:
+            d = self._closest_point_in_patch(points, cx, cy, h, w)
+            if d is None:
                 continue
 
             depth = np.linalg.norm(d)
-            if depth > 4.0:
+            if depth > self.MAX_DEPTH:
                 continue
 
             p_cam = PointStamped()
             p_cam.header.frame_id = "oakd_rgb_camera_optical_frame"
-            # p_cam.header.stamp = data.header.stamp
-            p_cam.header.stamp = Time().to_msg()
+            p_cam.header.stamp = Time().to_msg()  # latest available, no extrapolation
             p_cam.point.x = float(d[0])
             p_cam.point.y = float(d[1])
             p_cam.point.z = float(d[2])
@@ -275,14 +297,17 @@ class BarrelDetector(Node):
 
             pose = PoseStamped()
             pose.header.frame_id = f"{color}:{orientation}"
-            # pose.header.stamp = self.get_clock().now().to_msg()
-            pose.header.stamp = Time().to_msg()
+            # FIX: real stamp instead of zero time
+            pose.header.stamp = self.get_clock().now().to_msg()
             pose.pose.position.x = p_map.point.x
             pose.pose.position.y = p_map.point.y
             pose.pose.position.z = p_map.point.z
             self.barrel_pub.publish(pose)
 
-            self.get_logger().info(f"Barrel: {color} {orientation} at ({p_map.point})")
+            self.get_logger().info(
+                f"Barrel: {color} {orientation} at "
+                f"({p_map.point.x:.2f}, {p_map.point.y:.2f}, {p_map.point.z:.2f})"
+            )
 
     def _amclPoseCallback(self, msg):
         self.current_pose = msg.pose

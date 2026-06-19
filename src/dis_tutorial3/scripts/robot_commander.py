@@ -28,6 +28,7 @@ from geometry_msgs.msg import (
 )
 from kittentts import KittenTTS
 from nav2_msgs.action import NavigateToPose, Spin
+from pyzbar.pyzbar import decode as decode_qr
 from rclpy.action import ActionClient
 from rclpy.duration import Duration as RDuration
 from rclpy.node import Node
@@ -41,6 +42,7 @@ from rclpy.time import Time
 from sensor_msgs.msg import (
     CameraInfo,
     Image,
+    LaserScan,
     PointCloud2,  # add to your sensor_msgs import
 )
 from std_msgs.msg import String
@@ -50,8 +52,6 @@ from turtle_tf2_py.turtle_tf2_broadcaster import quaternion_from_euler
 from visualization_msgs.msg import Marker
 
 from dis_tutorial3_interfaces.msg import FaceDetection
-from sensor_msgs.msg import LaserScan
-from std_msgs.msg import String
 
 
 class Task(Enum):
@@ -76,20 +76,24 @@ def parse_instruction(text):
     t = (text or "").lower()
     print(f"PARSING INSTRUCTION {t}")
     is_belt = any(k in t for k in ("anomal", "defect", "belt"))
+    task = None
+    is_visitor = False
     if is_belt and "red" in t:
-        return {"type": Task.INSPECT_BELT, "color": "red"}
-    if is_belt and "green" in t:
-        return {"type": Task.INSPECT_BELT, "color": "green"}
-    if "ring" in t:
-        return {"type": Task.FIND_RINGS}
-    if "barrel" in t:
-        return {"type": Task.FIND_BARRELS}
-    return None
+        task = {"type": Task.INSPECT_BELT, "color": "red"}
+    elif is_belt and "green" in t:
+        task = {"type": Task.INSPECT_BELT, "color": "green"}
+    elif "ring" in t:
+        task = {"type": Task.FIND_RINGS}
+    elif "barrel" in t:
+        task = {"type": Task.FIND_BARRELS}
+    elif "visitor" in t:
+        is_visitor = True
+    return task, is_visitor
 
 
 class RobotCommander(Node):
     MAX_GREET_ATTEMPTS = 2
-    FACE_STANDOFF = 0.5
+    FACE_STANDOFF = 0.4
     USE_WAYPOINT_ORIENTATION = True
     BELT_SPEED = 0.15
     BELT_STEER_GAIN = 0.003
@@ -154,7 +158,8 @@ class RobotCommander(Node):
 
         self.turning_left = False
         self.turn_start = 0
-        self.blue_done = False
+        self.first_room_done = False
+        self.second_room_done = False
         self.blue_line_start = (2.75, -0.35)
         self.line_error = 0.0
 
@@ -187,12 +192,7 @@ class RobotCommander(Node):
 
         self.latest_scan = None
 
-        self.create_subscription(
-            LaserScan,
-            "/scan",
-            self._scan_callback,
-            10
-        )
+        self.create_subscription(LaserScan, "/scan", self._scan_callback, 10)
 
         self.create_subscription(
             PoseWithCovarianceStamped,
@@ -232,26 +232,21 @@ class RobotCommander(Node):
         self.create_subscription(
             PointCloud2, "/oakd/rgb/preview/depth/points", self._frontCloudCallback, 10
         )
-
-        self.face_marker_pub = self.create_publisher(
-            Marker, "/detected_face_marker", 10
+        marker_qos = QoSProfile(
+            depth=10,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
         )
-        self.arm_mover_pub = self.create_publisher(String, "/arm_command", 10)
+        self.face_marker_pub = self.create_publisher(
+            Marker, "/detected_face_marker", marker_qos
+        )
         self.ring_marker_pub = self.create_publisher(
-            Marker, "/detected_ring_marker", 10
+            Marker, "/detected_ring_marker", marker_qos
         )
         self.barrel_marker_pub = self.create_publisher(
-            Marker, "/detected_barrel_marker", 10
+            Marker, "/detected_barrel_marker", marker_qos
         )
-        self.belt_points_pub = self.create_publisher(
-            Marker, "/detected_belts_marker", 10
-        )
-        self.arm_pub = self.create_publisher(
-            String,
-            "/arm_command",
-            10
-        )
-        self.goal_marker_pub = self.create_publisher(Marker, "/goal_marker", 10)
+        self.arm_pub = self.create_publisher(String, "/arm_command", 10)
+        self.goal_marker_pub = self.create_publisher(Marker, "/goal_marker", marker_qos)
         self.tts_pub = self.create_publisher(String, "/speak", 10)
         self.cmd_vel_pub = self.create_publisher(TwistStamped, "/cmd_vel", 10)
 
@@ -268,7 +263,7 @@ class RobotCommander(Node):
         self.JOB_UPDATE = {
             Task.EXPLORE: self.update_task_complete,
             Task.GOTO_FACE: self.update_task_complete,
-            Task.GOTO_POINT: self.update_task_complete,
+            Task.GOTO_POINT: self.update_goto_point,
             Task.FIND_RINGS: self.update_task_complete,
             Task.FIND_BARRELS: self.update_task_complete,
             Task.INSPECT_BELT: self.update_inspect_belt,
@@ -310,7 +305,7 @@ class RobotCommander(Node):
 
         center = len(ranges) // 2
 
-        front = ranges[center - 20:center + 20]
+        front = ranges[center - 20 : center + 20]
 
         return np.min(front) < distance
 
@@ -384,9 +379,7 @@ class RobotCommander(Node):
         candidates = [
             f
             for f in self.detected_faces
-            if not f["greeted"]
-            and f["attempts"] < self.MAX_GREET_ATTEMPTS
-            and np.linalg.norm(f["pos"] - robot_pos) <= 2.5
+            if not f["greeted"] and f["attempts"] < self.MAX_GREET_ATTEMPTS
         ]
 
         face = min(
@@ -401,13 +394,20 @@ class RobotCommander(Node):
     def next_job(self):
         if self.job_queue:
             return self.job_queue.pop(0)
+
+        face = self.next_person()
+        if face is not None:
+            return {"type": Task.GOTO_FACE, "face": face}
+
         if not self.exploration_done():
             return {"type": Task.EXPLORE}
         face = self.next_person()
         if face is not None:
             return {"type": Task.GOTO_FACE, "face": face}
-        return {"type": Task.INSPECT_BELT, "color": "green"}
-        # if not getattr(self, "blue_done", False):
+        else:
+            self.first_room_done = True
+        # return {"type": Task.INSPECT_BELT, "color": "green"}
+        # if not self.second_room_done:
         #     return {"type": Task.FOLLOW_BLUE}
         return None
 
@@ -419,90 +419,17 @@ class RobotCommander(Node):
     def enqueue(self, job):
         self.job_queue.append(job)
 
-    # def _accumulate_belt_points(self):
-    #     if self.latest_front_image is None or self.latest_front_cloud is None:
-    #         return
-    #     img = self.latest_front_image
-    #     cloud = self.latest_front_cloud
-    #     h, w = cloud.shape[:2]
-    #     frame = self.front_cloud_header.frame_id
-    #     v_off = int(img.shape[0] * 0.5)  # find_line uses the bottom half as ROI
-
-    #     for color in ("red", "green"):
-    #         found, _, _, _, mask, _, _, _ = self.line_detector.find_line(img, color)
-    #         if not found or mask is None:
-    #             continue
-    #         ys, xs = np.nonzero(mask)
-    #         if xs.size == 0:
-    #             continue
-    #         for i in range(0, xs.size, self.BELT_POINT_STRIDE):
-    #             u = int(xs[i])
-    #             v = int(ys[i]) + v_off
-    #             if not (0 <= v < h and 0 <= u < w):
-    #                 continue
-    #             d = cloud[v, u, :]
-    #             if not np.isfinite(d).all() or np.linalg.norm(d) < 0.001:
-    #                 continue
-    #             if np.linalg.norm(d) > self.BELT_MAX_RANGE:
-    #                 continue
-    #             pm = self._to_map(d, frame, self.front_cloud_header.stamp)
-    #             if pm is None:
-    #                 continue
-    #             self.belt_points[color].append((pm.point.x, pm.point.y))
-    #         if len(self.belt_points[color]) > self.BELT_MAX_POINTS:
-    #             self.belt_points[color] = self.belt_points[color][
-    #                 -self.BELT_MAX_POINTS :
-    #             ]
-
-    # fit a straight line to the accumulated points; returns (lane_start, lane_end, yaw) or None
-    def _fit_belt(self, color):
+    def get_belt_start(self, color):
         if color == "green":
             start = np.array([0.35, -4.29])
-            end = np.array([0.415, -4.29])
             yaw = math.pi * 1.55
         elif color == "red":
             start = np.array([-4.22, -2.72])
-            end = np.array([-4.65, 0.23])
             yaw = math.pi
         else:
             return None
 
-        # yaw = math.atan2(end[1] - start[1], end[0] - start[0])
-        return start, end, yaw
-        # pts = np.array(self.belt_points.get(color, []), dtype=float)
-        # if len(pts) < self.BELT_MIN_POINTS:
-        #     self.warn(f"only {len(pts)} {color} points, need {self.BELT_MIN_POINTS}")
-        #     return None
-
-        # c = pts.mean(axis=0)
-        # _, _, vt = np.linalg.svd(pts - c, full_matrices=False)
-        # d = vt[0]
-        # d = d / np.linalg.norm(d)
-
-        # proj = (pts - c) @ d
-        # s0, s1 = float(proj.min()), float(proj.max())
-        # if (s1 - s0) < self.BELT_MIN_LENGTH:
-        #     self.warn(f"{color} line fit too short ({s1 - s0:.2f} m)")
-        #     return None
-
-        # start = c + d * s0
-        # end = c + d * s1
-
-        # # drive from whichever end is closer to the robot
-        # if self.current_pose is not None:
-        #     rp = np.array(
-        #         [self.current_pose.pose.position.x, self.current_pose.pose.position.y]
-        #     )
-        #     if np.linalg.norm(rp - end) < np.linalg.norm(rp - start):
-        #         start, end = end, start
-        #         d = -d
-
-        # perp = np.array([-d[1], d[0]])
-        # off = perp * self.BELT_SIDE * self.BELT_LANE_OFFSET
-        # lane_start = start + off
-        # lane_end = end + off
-        # yaw = math.atan2(d[1], d[0])
-        # return lane_start, lane_end, yaw
+        return start, yaw
 
     # if a task needs to wait for nav / rotation
     def update_task_complete(self, job):
@@ -530,7 +457,8 @@ class RobotCommander(Node):
         face = job["face"]
         pos = face["pos"] + face["normal"] * self.FACE_STANDOFF
         direction = face["pos"] - pos
-        yaw = math.atan2(direction[1], direction[0]) + 0.25
+        yaw = math.atan2(direction[1], direction[0]) + 0.45
+        print(f"going to face with yaw {yaw}")
         self.publish_goal_marker(float(pos[0]), float(pos[1]))
         self.nav2_pose(self._pose(pos, yaw))
 
@@ -538,6 +466,17 @@ class RobotCommander(Node):
     def done_goto_face(self, job, result):
         face = job["face"]
         if result == TaskResult.SUCCEEDED:
+            # spin to face the face explicitly
+            target_yaw = (
+                math.atan2(
+                    face["pos"][1] - self.current_pose.pose.position.y,
+                    face["pos"][0] - self.current_pose.pose.position.x,
+                )
+                + 0.3
+            )
+            current_yaw = self._current_yaw()
+            delta = self._angle_diff(target_yaw, current_yaw)
+            self.spin(delta)
             self.enqueue({"type": Task.CONVERSE, "face": face})
         else:
             face["attempts"] += 1
@@ -550,9 +489,31 @@ class RobotCommander(Node):
         gender = "woman" if face["pronouns"] in ("she/her") else "man"
         self.say(f"Hello {face['name']} {gender}, the {face['job']}.")
 
-        task = parse_instruction(self.read_qr())
+        qr = self.read_qr()
+        stepped_in = 0
+        step = 0.15  # metres per nudge
+        max_steps = 4
+
+        while not qr and stepped_in < max_steps:
+            self._drive(0.15, 0.0)
+            time.sleep(0.5)
+            self._stop()
+            time.sleep(0.2)
+            rclpy.spin_once(self, timeout_sec=0.1)
+            qr = self.read_qr()
+            stepped_in += 1
+
+        if stepped_in > 0:
+            self._drive(-0.15, 0.0)
+            time.sleep(step * stepped_in / 0.15)
+            self._stop()
+
+        task, is_visitor = parse_instruction(qr)
+        if is_visitor:
+            self.say("Hope you have a nice time")
+            return
         if task is None:
-            self.say("couldnt understand instruction")
+            self.say("couldn't understand instruction")
             self.warn("invalid qr")
             return
         self.say(f"OK. I will {self._task_phrase(task)}.")
@@ -644,22 +605,17 @@ class RobotCommander(Node):
 
     # fit the belt line from the patrol points, drive to its near end, then along it
     def start_inspect_belt(self, job):
-        s = String()
-        s.data = "look_at_belt_left"
-        self.arm_mover_pub.publish(s)
-        # print(self._belt_anomaly())
-        # return
+        self.set_arm("look_at_belt_left")
         color = job["color"]
         self.target_line = color
-        fit = self._fit_belt(color)
+        fit = self.get_belt_start(color)
         job["fitted"] = fit is not None
         job["anomalies"] = 0
         job["last_anomaly_t"] = 0.0
         if fit is None:
             self.warn(f"could not fit a {color} belt line")
             return
-        lane_start, lane_end, yaw = fit
-        job["lane_end"] = np.array([lane_end[0], lane_end[1], 0.0])
+        lane_start, yaw = fit
         job["yaw"] = yaw
         job["phase"] = "goto_start"
 
@@ -723,7 +679,6 @@ class RobotCommander(Node):
                     h, w = img.shape[:2]
 
                     right_half = img[:, w // 2 :]
-                    cv2.imshow("DESNA", right_half)
 
                     found, *_ = self.line_detector.find_line(
                         right_half,
@@ -812,13 +767,7 @@ class RobotCommander(Node):
         if job["phase"] != "follow":
             return False
 
-        cto = next(
-            (
-                f for f in self.detected_faces
-                if "cto" in f["job"].lower()
-            ),
-            None
-        )
+        cto = next((f for f in self.detected_faces if "cto" in f["job"].lower()), None)
 
         if cto is not None:
             self._stop()
@@ -826,6 +775,15 @@ class RobotCommander(Node):
             self.enqueue({"type": Task.GOTO_FACE, "face": cto})
 
             self.info("CTO found")
+
+            pdf_bytes = self.generate_report()
+            report_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "report.pdf"
+            )
+            with open(report_path, "wb") as f:
+                f.write(pdf_bytes)
+            self.info(f"report written to {report_path}")
+
             return True
 
         img = self.latest_top_image
@@ -912,10 +870,7 @@ class RobotCommander(Node):
 
         raw_err = target_x - width / 2
 
-        self.line_error = (
-            0.5 * self.line_error +
-            0.5 * raw_err
-        )
+        self.line_error = 0.5 * self.line_error + 0.5 * raw_err
 
         err = self.line_error
         angular_speed = -0.003 * err
@@ -928,7 +883,7 @@ class RobotCommander(Node):
 
     def done_follow_blue(self, job, result):  # TODO: actually print the damn pdf
         self._stop()
-        self.blue_done = True
+        self.second_room_done = True
         self.say(
             f"I found the CTO. I detected {len(self.detected_rings)} rings and {len(self.detected_barrels)} barrels."
         )
@@ -951,8 +906,15 @@ class RobotCommander(Node):
     def read_qr(self):
         if self.latest_front_image is None:
             return ""
-        data, _, _ = self.qr.detectAndDecode(self.latest_front_image)
-        return data
+        results = decode_qr(self.latest_front_image)
+        if results:
+            return results[0].data.decode("utf-8")
+        # retry upscaled
+        big = cv2.resize(
+            self.latest_front_image, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC
+        )
+        results = decode_qr(big)
+        return results[0].data.decode("utf-8") if results else ""
 
     def _belt_anomaly(self):
         if self.latest_top_image is None:
@@ -964,7 +926,6 @@ class RobotCommander(Node):
             int(h_full * 0.32) : int(h_full * 0.8),
             int(w_full * 0.2) : int(w_full * 0.8),
         ]
-        cv2.imshow("img", img)
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         _, thresh = cv2.threshold(gray, 140, 255, cv2.THRESH_BINARY)
@@ -987,6 +948,15 @@ class RobotCommander(Node):
         return bool(is_anomaly)
 
     def nav2_pose(self, pose):
+        target = np.array([pose.pose.position.x, pose.pose.position.y, 0.0])
+        heading = self._heading_to(target)
+        current = self._current_yaw()
+        diff = abs(self._angle_diff(heading, current))
+        if diff > math.radians(30):
+            self.spin(self._angle_diff(heading, current))
+            while not self.isTaskComplete() and rclpy.ok():
+                rclpy.spin_once(self, timeout_sec=0.05)
+
         while not self.nav_to_pose_client.wait_for_server(timeout_sec=1.0):
             self.info("waiting for NavigateToPose server...")
         goal_msg = NavigateToPose.Goal()
@@ -1044,6 +1014,7 @@ class RobotCommander(Node):
 
     def say(self, text):
         self.tts.generate_to_file(text, self._wav_path, voice="Jasper", speed=1.0)
+        print(f"SAYING: {text}")
         subprocess.run(
             ["ffplay", "-nodisp", "-autoexit", self._wav_path],
             stdout=subprocess.DEVNULL,
@@ -1083,12 +1054,13 @@ class RobotCommander(Node):
         confirmed,
         pos,
         fields,
-        min_count=10,
+        min_count=7,
         window=2.0,
-        merge_dist=3.0,
+        merge_dist=2.0,
     ):
         now = time.time()
         if any(np.linalg.norm(pos - r["pos"]) < merge_dist for r in confirmed):
+            # print("merge dist")
             return None
 
         i = next(
@@ -1101,6 +1073,7 @@ class RobotCommander(Node):
         )
         if i is None:
             candidates.append({"pos": pos, "times": [now], **fields})
+            # print("first time")
             return None
 
         c = candidates[i]
@@ -1114,15 +1087,21 @@ class RobotCommander(Node):
             confirmed.append(record)
             candidates.pop(i)
             return record
+        # print("not enough")
         return None
 
     def _amclPoseCallback(self, msg):
         self.current_pose = msg.pose
 
     def _facePosCallback(self, msg):
-        if self.current_pose is None:
-            return
-
+        # if self.current_pose is None:
+        #     return
+        # robot_pos = np.array(
+        #     [self.current_pose.pose.position.x, self.current_pose.pose.position.y, 0.0]
+        # )
+        # if np.linalg.norm(pos - robot_pos) > 2.5:
+        #     print("face too far")
+        #     return
         pos = np.array(
             [
                 msg.pose.pose.position.x,
@@ -1135,13 +1114,6 @@ class RobotCommander(Node):
         nrm = np.linalg.norm(normal)
         if nrm > 0:
             normal = normal / nrm
-
-        # robot_pos = np.array(
-        #     [self.current_pose.pose.position.x, self.current_pose.pose.position.y, 0.0]
-        # )
-        # if np.linalg.norm(pos - robot_pos) > 2.5:
-        #     print("face too far")
-        #     return
 
         for f in self.detected_faces:
             if np.linalg.norm(pos - f["pos"]) < 0.5:
@@ -1161,6 +1133,7 @@ class RobotCommander(Node):
                 "pronouns": msg.pronouns,
                 "normal": normal,
             },
+            min_count=3,
         )
         if rec is not None:
             rec["greeted"] = False
@@ -1170,8 +1143,8 @@ class RobotCommander(Node):
             else:
                 rec["image_bytes"] = None
             self.info(f"CONFIRMED face at {rec['pos']}")
-        # else:
-        #     print("face not detected enough")
+        else:
+            print("face not detected enough")
 
     def screenshot(self):
         return cv2.imencode(".jpg", self.latest_front_image)[1].tobytes()
@@ -1214,8 +1187,8 @@ class RobotCommander(Node):
     def _topCameraCallback(self, msg):
         self.latest_top_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
 
-        cv2.imshow("TOP CAMERA", self.latest_top_image)
-        cv2.waitKey(1)
+        # cv2.imshow("TOP CAMERA", self.latest_top_image)
+        # cv2.waitKey(1)
 
     def _frontCameraCallback(self, msg):
         self.latest_front_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
@@ -1281,23 +1254,6 @@ class RobotCommander(Node):
             m.pose.position.y = float(barrel["pos"][1])
             m.pose.position.z = 0.3
             self.barrel_marker_pub.publish(m)
-
-        for j, color in enumerate(("red", "green")):
-            m = Marker()
-            m.header.frame_id = "map"
-            m.header.stamp = self.get_clock().now().to_msg()
-            m.ns = "belt_points"
-            m.id = j
-            m.type = Marker.POINTS
-            m.action = Marker.ADD
-            m.scale.x = 0.03  # point size in metres
-            m.scale.y = 0.03
-            m.color.r, m.color.g, m.color.b = self._color_to_rgb(color)
-            m.color.a = 1.0
-            m.points = [
-                Point(x=float(x), y=float(y), z=0.0) for x, y in self.belt_points[color]
-            ]
-            self.belt_points_pub.publish(m)
 
     def _frontCloudCallback(self, msg):
         cloud = pc2.read_points_numpy(msg, field_names=("x", "y", "z"))

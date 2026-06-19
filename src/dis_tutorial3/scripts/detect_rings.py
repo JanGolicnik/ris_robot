@@ -64,10 +64,6 @@ class RingDetector(Node):
         self.marker_pub = self.create_publisher(Marker, "/ring_markers", 10)
         self.marker_id = 0
 
-        # cv2.namedWindow("Detected contours", cv2.WINDOW_NORMAL)
-        # cv2.namedWindow("thresh_gray", cv2.WINDOW_NORMAL)
-        # cv2.namedWindow("thresh_sat", cv2.WINDOW_NORMAL)
-        # cv2.namedWindow("thresh_depth", cv2.WINDOW_NORMAL)
         cv2.namedWindow("Detected rings", cv2.WINDOW_NORMAL)
 
     def pointcloud_callback(self, msg):
@@ -77,29 +73,6 @@ class RingDetector(Node):
 
     def remove_pole(self, image, depth):
         return image, depth
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        pole_mask = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 60, 150]))
-
-        kernel = np.ones((5, 5), np.uint8)
-        pole_mask = cv2.morphologyEx(pole_mask, cv2.MORPH_CLOSE, kernel)
-        pole_mask = cv2.morphologyEx(pole_mask, cv2.MORPH_OPEN, kernel)
-        # cv2.imshow("pole mask", pole_mask)
-        hsv_inpainted = cv2.inpaint(
-            hsv, pole_mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA
-        )
-        result = cv2.cvtColor(hsv_inpainted, cv2.COLOR_HSV2BGR)
-
-        depth_u8 = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-        depth_inpainted_u8 = cv2.inpaint(
-            depth_u8, pole_mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA
-        )
-
-        d_min, d_max = np.nanmin(depth), np.nanmax(depth)
-        depth_inpainted = (
-            depth_inpainted_u8.astype(np.float32) / 255.0 * (d_max - d_min) + d_min
-        )
-
-        return result, depth_inpainted
 
     def get_ring_color(self, cv_image, candidate):
         le, se = candidate
@@ -113,18 +86,16 @@ class RingDetector(Node):
         hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
         pixels = hsv[mask > 0]
 
-        debug = cv_image.copy()
-        debug[mask > 0] = (0, 255, 255)
-
         colors = []
         for h, s, v in pixels:
+            # FIX: low-saturation pixels are classified once and skipped,
+            # instead of falling through and being double-counted by hue.
             if s < 100:
-                # colors.append("black")
                 colors.append("unknown")
+                continue
             if h < 10 or h > 160:
                 colors.append("red")
             elif h < 25:
-                # colors.append("orange")
                 colors.append("unknown")
             elif h < 35:
                 colors.append("yellow")
@@ -133,7 +104,6 @@ class RingDetector(Node):
             elif h < 130:
                 colors.append("blue")
             elif h < 160:
-                # colors.append("purple")
                 colors.append("unknown")
             else:
                 colors.append("unknown")
@@ -173,7 +143,10 @@ class RingDetector(Node):
         p.point.z = float(pt[2])
 
         try:
-            point_map = self.tf_buffer.transform(p, "map")
+            # FIX: bounded timeout so a missing transform can't hang the callback.
+            point_map = self.tf_buffer.transform(
+                p, "map", timeout=rclpy.duration.Duration(seconds=0.1)
+            )
             return np.array([point_map.point.x, point_map.point.y, point_map.point.z])
         except Exception as e:
             self.get_logger().warn(f"TF transform failed: {e}")
@@ -226,28 +199,14 @@ class RingDetector(Node):
     def get_contours(self, cv_image, depth):
         kernel = np.ones((3, 3), np.uint8)
 
-        # gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
-        # thresh_gray = cv2.adaptiveThreshold(
-        #     gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 9, 7
-        # )
-        # # thresh_gray = cv2.erode(thresh_gray, kernel, iterations=1)
-        # # thresh_gray = cv2.dilate(thresh_gray, kernel, iterations=1)
-        # gray_contours, _ = cv2.findContours(
-        #     thresh_gray, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
-        # )
-
         hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
         sat = hsv[:, :, 1]
         kernel = np.ones((5, 5), np.uint8)
         sat = cv2.morphologyEx(sat, cv2.MORPH_CLOSE, kernel)
-        # sat = cv2.morphologyEx(sat, cv2.MORPH_OPEN, kernel)
-        # cv2.imshow("sat", sat)
         thresh_sat = cv2.adaptiveThreshold(
             sat, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 5, 7
         )
 
-        # thresh_sat = cv2.erode(thresh_sat, kernel, iterations=1)
-        # thresh_sat = cv2.dilate(thresh_sat, kernel, iterations=1)
         sat_contours, _ = cv2.findContours(
             thresh_sat, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
         )
@@ -269,15 +228,6 @@ class RingDetector(Node):
         )
 
         contours = depth_contours + sat_contours
-        # contours = gray_contours + depth_contours + sat_contours
-
-        # cv2.imshow("thresh_gray", thresh_gray)
-        # cv2.imshow("thresh_sat", thresh_sat)
-        # cv2.imshow("thresh_depth", thresh_depth)
-
-        debug = cv_image.copy()
-        cv2.drawContours(debug, contours, -1, (255, 0, 0), 1)
-        # cv2.imshow("Detected contours", debug)
 
         return contours
 
@@ -330,7 +280,7 @@ class RingDetector(Node):
 
         return candidates
 
-    def check_hollow(self, candidate, debug_img=None):
+    def check_hollow(self, candidate, depth, debug_img=None):
         le, se = candidate
 
         ex, ey = int(le[0][0]), int(le[0][1])
@@ -344,15 +294,10 @@ class RingDetector(Node):
             px = int(ex + x * np.cos(angle) - y * np.sin(angle))
             py = int(ey + x * np.sin(angle) + y * np.cos(angle))
 
-            if (
-                0 <= px < self.depth_image.shape[1]
-                and 0 <= py < self.depth_image.shape[0]
-            ):
-                d = self.depth_image[py, px]
+            if 0 <= px < depth.shape[1] and 0 <= py < depth.shape[0]:
+                d = depth[py, px]
                 if d > 0 and np.isfinite(d):
                     rim_depths.append(d)
-                    # if debug_img is not None:
-                    #     cv2.circle(debug_img, (px, py), 2, (0, 255, 0), -1)
 
         if len(rim_depths) == 0:
             return False
@@ -363,14 +308,11 @@ class RingDetector(Node):
         rx = int(se[1][0] * 0.3)
         ry = int(se[1][1] * 0.3)
         cy1 = max(0, cy - ry)
-        cy2 = min(self.depth_image.shape[0], cy + ry)
+        cy2 = min(depth.shape[0], cy + ry)
         cx1 = max(0, cx - rx)
-        cx2 = min(self.depth_image.shape[1], cx + rx)
+        cx2 = min(depth.shape[1], cx + rx)
 
-        # if debug_img is not None:
-        #     cv2.rectangle(debug_img, (cx1, cy1), (cx2, cy2), (0, 0, 255), 1)
-
-        inner_depth = self.depth_image[cy1:cy2, cx1:cx2]
+        inner_depth = depth[cy1:cy2, cx1:cx2]
         valid = inner_depth[inner_depth > 0]
 
         if len(valid) == 0:
@@ -382,6 +324,8 @@ class RingDetector(Node):
         if self.depth_image is None:
             return
 
+        # FIX: snapshot depth once and pass it through; never read the live
+        # self.depth_image mid-processing (avoids races and frame mismatch).
         depth = self.depth_image.copy()
 
         try:
@@ -395,12 +339,10 @@ class RingDetector(Node):
         contours = self.get_contours(cv_image, depth)
 
         elps = self.fit_ellipses(contours)
-        # for e in elps:
-        #     cv2.ellipse(cv_image, e, (255, 0, 0), 1)
 
         candidates = self.find_ring_candidates(elps)
 
-        candidates = [c for c in candidates if self.check_hollow(c, cv_image)]
+        candidates = [c for c in candidates if self.check_hollow(c, depth, cv_image)]
 
         self.get_logger().info(f"Found {len(candidates)} ring candidates")
 
