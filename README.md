@@ -28,3 +28,4 @@ Should do:
 
 ``` pip install insightface onnxruntime numpy opencv-python ```
 ``` pip install fpdf ```
+``` pip install pyzbar ```

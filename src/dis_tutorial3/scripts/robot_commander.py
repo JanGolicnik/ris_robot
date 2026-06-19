@@ -96,6 +96,7 @@ class RobotCommander(Node):
     FACE_STANDOFF = 0.4
     USE_WAYPOINT_ORIENTATION = True
     BELT_SPEED = 0.15
+    BELT_EXIT_SECS = 1.5  # how long to drive forward after the final turn
     BELT_STEER_GAIN = 0.003
     BELT_LOST_LIMIT = 15
     ANOMALY_COOLDOWN = 1.0
@@ -114,7 +115,7 @@ class RobotCommander(Node):
     BELT_STRAIGHT_SECS_RED = 17.0
     BELT_COLOR_LOST_FRAMES = 10
 
-    GOTO_POINT_STANDOFF = 3.0
+    GOTO_POINT_STANDOFF = 1.0
 
     def __init__(self):
         super().__init__("robot_commander")
@@ -424,18 +425,14 @@ class RobotCommander(Node):
         if self.job_queue:
             return self.job_queue.pop(0)
 
-        face = self.next_person()
-        if face is not None:
-            return {"type": Task.GOTO_FACE, "face": face}
-
         if not self.exploration_done():
             return {"type": Task.EXPLORE}
-        face = self.next_person()
-        if face is not None:
-            return {"type": Task.GOTO_FACE, "face": face}
-        else:
-            self.first_room_done = True
-        # return {"type": Task.INSPECT_BELT, "color": "green"}
+        # face = self.next_person()
+        # if face is not None:
+        #     return {"type": Task.GOTO_FACE, "face": face}
+        # else:
+        #     self.first_room_done = True
+        # return {"type": Task.INSPECT_BELT, "color": "red"}
         # if not self.second_room_done:
         #     return {"type": Task.FOLLOW_BLUE}
         return None
@@ -586,13 +583,50 @@ class RobotCommander(Node):
 
     # queue a visit to every ring found during the patrol
     def start_find_rings(self, job):
-        for i, ring in enumerate(self.detected_rings):
+        if self.current_pose is None:
+            objects = self.detected_rings
+        else:
+            robot = np.array(
+                [
+                    self.current_pose.pose.position.x,
+                    self.current_pose.pose.position.y,
+                    0.0,
+                ]
+            )
+            objects = sorted(
+                self.detected_rings, key=lambda r: np.linalg.norm(r["pos"] - robot)
+            )
+        for i, ring in enumerate(objects):
             self.enqueue(
                 {
                     "type": Task.GOTO_POINT,
                     "pos": ring["pos"].copy(),
                     "yaw": None,
                     "label": f"ring {i} ({ring['color']})",
+                }
+            )
+
+    def start_find_barrels(self, job):
+        if self.current_pose is None:
+            objects = self.detected_barrels
+        else:
+            robot = np.array(
+                [
+                    self.current_pose.pose.position.x,
+                    self.current_pose.pose.position.y,
+                    0.0,
+                ]
+            )
+            objects = sorted(
+                self.detected_barrels, key=lambda b: np.linalg.norm(b["pos"] - robot)
+            )
+        for i, barrel in enumerate(objects):
+            self.enqueue(
+                {
+                    "type": Task.GOTO_POINT,
+                    "pos": barrel["pos"].copy(),
+                    "yaw": None,
+                    "label": f"barrel {i} ({barrel['color']})",
                 }
             )
 
@@ -607,18 +641,6 @@ class RobotCommander(Node):
                 image_bytes=ring.get("image_bytes"),
             )
         self.say(f"Found {len(self.detected_rings)} rings.")
-
-    # queue a visit to every barrel found during the patrol
-    def start_find_barrels(self, job):
-        for i, barrel in enumerate(self.detected_barrels):
-            self.enqueue(
-                {
-                    "type": Task.GOTO_POINT,
-                    "pos": barrel["pos"].copy(),
-                    "yaw": None,
-                    "label": f"barrel {i} ({barrel['color']})",
-                }
-            )
 
     def done_find_barrels(self, job, result):
         self.report_start_task("Find Barrels", face=job.get("face"))
@@ -656,22 +678,22 @@ class RobotCommander(Node):
         if not job.get("fitted", False):
             return True
 
-        if job["phase"] == "goto_start":
+        phase = job["phase"]
+
+        if phase == "goto_start":
             if not self.isTaskComplete():
                 return False
             job["lost"] = 0
-            job["final_turn"] = False
             job["phase"] = "forward"
             return False
 
-        if job["phase"] == "forward":
-            seen = False
+        if phase == "forward":
+            found = False
             if self.latest_front_image is not None:
                 found, *_ = self.line_detector.find_line(
                     self.latest_front_image, job["color"]
                 )
-                seen = found
-            if seen:
+            if found:
                 job["lost"] = 0
             else:
                 job["lost"] += 1
@@ -683,54 +705,74 @@ class RobotCommander(Node):
             self._drive(self.BELT_FORWARD_SPEED, 0.0)
             return False
 
-        if job["phase"] == "turn":
+        if phase == "turn":
             turned = abs(self._angle_diff(self._current_yaw(), job["turn_start_yaw"]))
             if turned >= math.pi * 0.5:
                 self._stop()
-                job["phase"] = "straight"
-                job["straight_start"] = time.time()
+                job["phase"] = "scan_belt"
+                job["scan_lost"] = 0
                 return False
             self._drive(0.0, -self.BELT_TURN_SPEED)
             return False
 
-        if job["phase"] == "straight":
-            move_time = 1.0
+        if phase == "scan_belt":
+            # drive forward alongside the belt checking for anomalies until belt disappears from front camera
+            self._belt_check_anomaly(job)
             turn_rate = 0.0
-
-            if not job["final_turn"]:
-                self._belt_check_anomaly(job)
-                move_time = (
-                    self.BELT_STRAIGHT_SECS_GREEN
-                    if job["color"] == "green"
-                    else self.BELT_STRAIGHT_SECS_RED
+            if self.latest_top_image is not None:
+                img = self.latest_top_image
+                h, w = img.shape[:2]
+                found, *_ = self.line_detector.find_line(img[:, w // 2 :], job["color"])
+                turn_rate = (
+                    self.BELT_TURN_SPEED * 0.5 if found else -self.BELT_TURN_SPEED * 0.5
                 )
-                if self.latest_top_image is not None:
-                    img = self.latest_top_image
-                    h, w = img.shape[:2]
 
-                    right_half = img[:, w // 2 :]
+            if self.latest_front_image is not None:
+                h, w = self.latest_front_image.shape[:2]
+                front_crop = self.latest_front_image[int(h * 0.8) :, : int(w * 0.2)]
+                belt_visible, *_ = self.line_detector.find_line(
+                    front_crop, job["color"]
+                )
 
-                    found, *_ = self.line_detector.find_line(
-                        right_half,
-                        job["color"],
-                    )
-                    if found:
-                        turn_rate = self.BELT_TURN_SPEED * 0.5
-                    else:
-                        turn_rate = -self.BELT_TURN_SPEED * 0.5
-
-            if time.time() - job["straight_start"] >= move_time:
-                self._stop()
-                if job["final_turn"]:
-                    return True
+                if belt_visible:
+                    job["scan_lost"] = 0
                 else:
-                    job["phase"] = "turn"
-                    job["turn_start_yaw"] = self._current_yaw()
-                    job["final_turn"] = True
-                return False
+                    job["scan_lost"] += 1
 
-            print(f"TURN RATE JE {turn_rate}")
+                if job["scan_lost"] >= self.BELT_COLOR_LOST_FRAMES:
+                    self._stop()
+                    job["phase"] = "nudge"
+                    job["nudge_start"] = time.time()
+                    return False
+
             self._drive(self.BELT_FORWARD_SPEED, turn_rate)
+            return False
+
+        if phase == "nudge":
+            if time.time() - job["nudge_start"] >= 1.0:
+                self._stop()
+                self._belt_check_anomaly(job)
+                job["phase"] = "final_turn"
+                job["turn_start_yaw"] = self._current_yaw()
+                return False
+            self._drive(self.BELT_FORWARD_SPEED, 0.0)
+            return False
+
+        if phase == "final_turn":
+            turned = abs(self._angle_diff(self._current_yaw(), job["turn_start_yaw"]))
+            if turned >= math.pi * 0.5:
+                self._stop()
+                job["phase"] = "exit"
+                job["exit_start"] = time.time()
+                return False
+            self._drive(0.0, -self.BELT_TURN_SPEED)
+            return False
+
+        if phase == "exit":
+            if time.time() - job["exit_start"] >= self.BELT_EXIT_SECS:
+                self._stop()
+                return True
+            self._drive(self.BELT_FORWARD_SPEED, 0.0)
             return False
 
         return True
@@ -973,32 +1015,70 @@ class RobotCommander(Node):
     def _belt_anomaly(self):
         if self.latest_top_image is None:
             return False
-        img = self.latest_top_image
-        h_full = img.shape[0]
-        w_full = img.shape[1]
+        img = self.latest_top_image.copy()
+        h_full, w_full = img.shape[:2]
         img = img[
             int(h_full * 0.32) : int(h_full * 0.8),
             int(w_full * 0.2) : int(w_full * 0.8),
         ]
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 140, 255, cv2.THRESH_BINARY)
+        _, thresh = cv2.threshold(gray, 70, 255, cv2.THRESH_BINARY)
         contours, _ = cv2.findContours(
             thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
         if not contours:
             return False
-        x, y, w, h = cv2.boundingRect(max(contours, key=cv2.contourArea))
+
+        largest = max(contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(largest)
+
+        # check if its roughly square
+        aspect = w / h if h > 0 else 0
+        if aspect < 1 or aspect > 1.3:
+            return False
+
         cx, cy = x + w // 2, y + h // 2
+
+        # check if its near the center
+        crop_h, crop_w = img.shape[:2]
+        if abs(cx - crop_w // 2) > crop_w * 0.1 or abs(cy - crop_h // 2) > crop_h * 0.1:
+            return False
+
         size = int(min(w, h) * 0.8)
         if size < 2:
             return False
+
         tile = img[cy - size // 2 : cy + size // 2, cx - size // 2 : cx + size // 2]
         if tile.size == 0:
             return False
+
         tile = cv2.resize(tile, (512, 512))
-        cv2.imshow("tile", tile)
-        is_anomaly, _, _ = self.anomaly_detector.detect(tile)
+
+        is_anomaly, mask, blackhat = self.anomaly_detector.detect(tile)
+
+        vis = tile.copy()
+        if mask is not None:
+            m = mask.copy()
+            if m.dtype != np.uint8:
+                m = ((m - m.min()) / (m.max() - m.min() + 1e-9) * 255).astype(np.uint8)
+            if len(m.shape) == 2:
+                m = cv2.applyColorMap(m, cv2.COLORMAP_JET)
+            vis = cv2.addWeighted(vis, 0.6, m, 0.4, 0)
+
+        label = "ANOMALY" if is_anomaly else "OK"
+        color = (0, 0, 255) if is_anomaly else (0, 255, 0)
+        cv2.putText(vis, label, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 2.0, color, 4)
+
+        debug = img.copy()
+        cv2.rectangle(debug, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+        cv2.imshow("cropped arm", debug)
+        # cv2.imshow("threshold", thresh)
+        cv2.imshow("tile", vis)
+        cv2.imshow("mask", mask)
+        cv2.imshow("blackhat", blackhat)
+
         return bool(is_anomaly)
 
     def nav2_pose(self, pose):
@@ -1204,6 +1284,8 @@ class RobotCommander(Node):
         return cv2.imencode(".jpg", self.latest_front_image)[1].tobytes()
 
     def _ringCallback(self, msg):
+        if self.first_room_done:
+            return
         pos = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
         rec = self._update_candidate(
             self.detected_ring_candidates,
@@ -1219,6 +1301,8 @@ class RobotCommander(Node):
             self.info(f"CONFIRMED ring: {rec['color']}")
 
     def _barrelCallback(self, msg):
+        if self.first_room_done:
+            return
         try:
             color, orientation = msg.header.frame_id.split(":")
         except ValueError:
@@ -1373,15 +1457,25 @@ class RobotCommander(Node):
     def generate_report(self) -> bytes:
         import os
         import tempfile
+        from datetime import date
 
         from fpdf import FPDF
+
+        def s(text):
+            # strip anything that can't be encoded in latin-1
+            return (text or "").encode("latin-1", errors="replace").decode("latin-1")
 
         pdf = FPDF()
         pdf.set_auto_page_break(auto=True, margin=15)
         pdf.add_page()
-        pdf.set_font("Helvetica", "B", 20)
-        pdf.cell(0, 10, "Robot Mission Report", ln=True)
-        pdf.ln(5)
+
+        # title block
+        pdf.set_font("Helvetica", "B", 24)
+        pdf.cell(0, 12, "Robot Mission Report", ln=True, align="C")
+        pdf.set_font("Helvetica", "", 12)
+        pdf.cell(0, 8, f"Robot: Bob", ln=True, align="C")
+        pdf.cell(0, 8, f"Date: {date.today().strftime('%d %B %Y')}", ln=True, align="C")
+        pdf.ln(8)
 
         def put_image(img_bytes, w=70):
             if not img_bytes:
@@ -1393,49 +1487,51 @@ class RobotCommander(Node):
                 pdf.image(tmp.name, w=w)
             except Exception as e:
                 pdf.set_font("Helvetica", "", 10)
-                pdf.cell(0, 6, f"[image error: {e}]", ln=True)
+                pdf.cell(0, 6, s(f"[image error: {e}]"), ln=True)
             finally:
                 tmp.close()
                 os.unlink(tmp.name)
 
         for i, entry in enumerate(self.report_entries):
-            # task header
             pdf.set_font("Helvetica", "B", 14)
-            pdf.cell(0, 10, f"Task {i + 1}: {entry['task_name']}", ln=True)
+            pdf.cell(0, 10, s(f"Task {i + 1}: {entry['task_name']}"), ln=True)
             pdf.line(pdf.get_x(), pdf.get_y(), pdf.get_x() + 190, pdf.get_y())
             pdf.ln(3)
 
-            # person block
             face = entry.get("face")
             if face:
                 pdf.set_font("Helvetica", "B", 11)
                 pdf.cell(0, 7, "Person:", ln=True)
                 pdf.set_font("Helvetica", "", 11)
-                pdf.cell(0, 6, f"  Name: {face.get('name', 'unknown')}", ln=True)
-                pdf.cell(0, 6, f"  Job: {face.get('job', 'unknown')}", ln=True)
+                pdf.cell(0, 6, s(f"  Name: {face.get('name', 'unknown')}"), ln=True)
+                pdf.cell(0, 6, s(f"  Job: {face.get('job', 'unknown')}"), ln=True)
                 pdf.cell(
-                    0, 6, f"  Pronouns: {face.get('pronouns', 'unknown')}", ln=True
+                    0, 6, s(f"  Pronouns: {face.get('pronouns', 'unknown')}"), ln=True
                 )
                 put_image(face.get("image_bytes"), w=60)
                 pdf.ln(3)
 
-            # items
             for item in entry.get("items", []):
                 t = item.get("type")
 
                 if t == "note":
                     pdf.set_font("Helvetica", "I", 10)
-                    pdf.cell(0, 6, item.get("text", ""), ln=True)
+                    pdf.cell(0, 6, s(item.get("text", "")), ln=True)
                     pdf.ln(1)
 
                 elif t == "ring":
                     pdf.set_font("Helvetica", "B", 11)
-                    pdf.cell(0, 7, f"Ring — color: {item.get('color', '?')}", ln=True)
+                    pdf.cell(
+                        0, 7, s(f"Ring - color: {item.get('color', '?')}"), ln=True
+                    )
                     pos = item.get("pos")
                     if pos is not None:
                         pdf.set_font("Helvetica", "", 10)
                         pdf.cell(
-                            0, 6, f"  Position: ({pos[0]:.2f}, {pos[1]:.2f})", ln=True
+                            0,
+                            6,
+                            s(f"  Position: ({pos[0]:.2f}, {pos[1]:.2f})"),
+                            ln=True,
                         )
                     put_image(item.get("image_bytes"))
                     pdf.ln(3)
@@ -1445,14 +1541,19 @@ class RobotCommander(Node):
                     pdf.cell(
                         0,
                         7,
-                        f"Barrel — color: {item.get('color', '?')}, orientation: {item.get('orientation', '?')}",
+                        s(
+                            f"Barrel - color: {item.get('color', '?')}, orientation: {item.get('orientation', '?')}"
+                        ),
                         ln=True,
                     )
                     pos = item.get("pos")
                     if pos is not None:
                         pdf.set_font("Helvetica", "", 10)
                         pdf.cell(
-                            0, 6, f"  Position: ({pos[0]:.2f}, {pos[1]:.2f})", ln=True
+                            0,
+                            6,
+                            s(f"  Position: ({pos[0]:.2f}, {pos[1]:.2f})"),
+                            ln=True,
                         )
                     put_image(item.get("image_bytes"))
                     pdf.ln(3)
@@ -1465,7 +1566,7 @@ class RobotCommander(Node):
 
                 else:
                     pdf.set_font("Helvetica", "", 10)
-                    pdf.cell(0, 6, f"[unknown item type: {t}]", ln=True)
+                    pdf.cell(0, 6, s(f"[unknown item type: {t}]"), ln=True)
 
             pdf.ln(6)
 
