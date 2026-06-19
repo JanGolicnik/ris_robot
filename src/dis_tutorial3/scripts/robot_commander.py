@@ -93,7 +93,7 @@ def parse_instruction(text):
 
 class RobotCommander(Node):
     MAX_GREET_ATTEMPTS = 2
-    FACE_STANDOFF = 0.4
+    FACE_STANDOFF = 0.5
     USE_WAYPOINT_ORIENTATION = True
     BELT_SPEED = 0.15
     BELT_EXIT_SECS = 1.5  # how long to drive forward after the final turn
@@ -115,7 +115,7 @@ class RobotCommander(Node):
     BELT_STRAIGHT_SECS_RED = 17.0
     BELT_COLOR_LOST_FRAMES = 10
 
-    GOTO_POINT_STANDOFF = 1.0
+    GOTO_POINT_STANDOFF = 2.0
 
     def __init__(self):
         super().__init__("robot_commander")
@@ -285,6 +285,13 @@ class RobotCommander(Node):
             Task.FOLLOW_BLUE: self.done_follow_blue,
         }
 
+        self.JOB_SKIPYELLOW = {
+            Task.CONVERSE: True,
+            Task.GOTO_FACE: True,
+            Task.INSPECT_BELT: True,
+            Task.FOLLOW_BLUE: True,
+        }
+
         self.info("Robot commander initialized")
 
     def set_arm(self, command):
@@ -340,12 +347,8 @@ class RobotCommander(Node):
             # self._accumulate_belt_points()
             self.publish_detection_markers()
 
-    # checks if it needs a new job, othewise runs the jobs update() and its done() if its finished
-    def tick(self):
-        cv2.waitKey(1)
-
+    def check_for_yellow(self):
         if self.yellow_danger() and not self.avoiding_yellow:
-
             self.info("YELLOW LINE DETECTED")
 
             self.avoiding_yellow = True
@@ -357,18 +360,20 @@ class RobotCommander(Node):
 
             self.spin(math.pi / 2)
 
-            return
-        
-        if self.avoiding_yellow:
+            return True
 
+        if self.avoiding_yellow:
             if not self.isTaskComplete():
                 return
 
             self.avoiding_yellow = False
             self.yellow_ignore_until = time.time() + 3.0
 
-            return
+            return True
 
+    # checks if it needs a new job, othewise runs the jobs update() and its done() if its finished
+    def tick(self):
+        cv2.waitKey(1)
         if self.current_job is None:
             self.current_job = self.next_job()
             if self.current_job is None:
@@ -385,6 +390,11 @@ class RobotCommander(Node):
             return
 
         job = self.current_job
+
+        # if not self.JOB_SKIPYELLOW.get(job["type"]):
+        #     if self.check_for_yellow():
+        #         return
+
         update = self.JOB_UPDATE.get(job["type"])
         if update is not None:
             # self.info(f"update job {job}")
@@ -427,14 +437,14 @@ class RobotCommander(Node):
 
         if not self.exploration_done():
             return {"type": Task.EXPLORE}
-        # face = self.next_person()
-        # if face is not None:
-        #     return {"type": Task.GOTO_FACE, "face": face}
-        # else:
-        #     self.first_room_done = True
-        # return {"type": Task.INSPECT_BELT, "color": "red"}
-        # if not self.second_room_done:
-        #     return {"type": Task.FOLLOW_BLUE}
+        face = self.next_person()
+        if face is not None:
+            return {"type": Task.GOTO_FACE, "face": face}
+        else:
+            self.first_room_done = True
+        return {"type": Task.INSPECT_BELT, "color": "red"}
+        if not self.second_room_done:
+            return {"type": Task.FOLLOW_BLUE}
         return None
 
     def exploration_done(self):
@@ -969,8 +979,7 @@ class RobotCommander(Node):
             return False
 
         found, cx, cy, _, mask, *_ = self.line_detector.find_line(
-            self.latest_top_image,
-            "yellow"
+            self.latest_top_image, "yellow"
         )
 
         if not found:
@@ -1002,6 +1011,7 @@ class RobotCommander(Node):
     def read_qr(self):
         if self.latest_front_image is None:
             return ""
+        cv2.imshow("qr image", self.latest_front_image)
         results = decode_qr(self.latest_front_image)
         if results:
             return results[0].data.decode("utf-8")

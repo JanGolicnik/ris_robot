@@ -1,0 +1,6 @@
+#!/bin/bash
+
+ x-terminal-emulator -- bash -c "source setup; source run_arm; exec bash" &
+ x-terminal-emulator -- bash -c "source setup; source run_rings; exec bash" &
+ x-terminal-emulator -- bash -c "source setup; source run_barrels; exec bash" &
+ x-terminal-emulator -- bash -c "source setup; source .venv/bin/activate; source run_detection; exec bash" &
