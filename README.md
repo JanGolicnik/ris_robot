@@ -13,9 +13,9 @@ Must do:
 
 Should do:
 - [x] Face recognition (1 pt)
-- [ ] Gender recognition (1 pt)
+- [X] Gender recognition (1 pt)
 - [ ] Auton. space exploration (1 pt)
-- [ ] Not crossing yellow line (2 pts)
+- [X] Not crossing yellow line (2 pts)
 - [x] Follow blue line (2 pts)
 - [ ] Correct cell detection (1 pt)
 - [x] Tile detection (1 pt)

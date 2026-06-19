@@ -463,7 +463,7 @@ class RobotCommander(Node):
 
     # set the next waypoint to visit
     def start_explore(self, job):
-        self.set_arm("manual:[0.,0.4,1.9,0.9]")
+        self.set_arm("manual:[0.,0.3,1.6,1.4]")
         wp = self.patrol_waypoints[self._patrol_i]
         self._patrol_i += 1
         pos = np.array([wp["x"], wp["y"], 0.0])
